@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>用例管理平台</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=20260827-15">
+</head>
+<body>
+  <!-- 登录页 -->
+  <div id="login-page">
+    <div class="login-box">
+      <h2>用例管理平台</h2>
+      <form id="login-form">
+        <input type="text" id="login-username" placeholder="账号" required autofocus>
+        <input type="password" id="login-password" placeholder="密码" required>
+        <button type="submit" id="login-btn">登录</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 主应用 -->
+  <div id="app">
+    <!-- 顶部栏 -->
+    <div class="topbar">
+      <div class="topbar-left">
+        <h1>用例管理平台</h1>
+        <div id="current-project-name" style="font-weight:600">未选择项目</div>
+        <div class="stats-bar" id="stats-bar">
+          <span>共 0 条</span>
+        </div>
+        <button id="btn-summary" class="summary-btn" disabled>总结结果</button>
+      </div>
+      <div class="topbar-right">
+        <div class="search-box">
+          <input type="text" id="search-input" placeholder="搜索用例标题/序号/模块">
+          <button id="btn-search">搜索</button>
+        </div>
+        <button id="btn-columns">列设置</button>
+        <button id="btn-import">用例导入</button>
+        <button id="btn-backup" class="admin-only">数据库备份</button>
+      </div>
+    </div>
+
+    <div class="main-container">
+      <!-- 侧边栏 -->
+      <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <h3>项目列表</h3>
+          <button id="btn-add-project">新建</button>
+        </div>
+        <div class="project-list" id="project-list"></div>
+      </div>
+
+      <!-- 内容区 -->
+      <div class="content">
+        <div class="toolbar">
+          <div class="toolbar-left">
+            <button id="btn-toggle-sidebar" class="secondary" title="收起/展开项目列表">☰</button>
+            <span id="current-version-name" style="font-weight:600;color:#303133"></span>
+            <button id="btn-add-version">新建版本</button>
+          </div>
+          <div class="toolbar-right">
+            <label class="switch-wrap">
+              <input type="checkbox" id="edit-mode-toggle">
+              <span class="switch-slider"></span>
+              <span>编辑模式</span>
+            </label>
+            <button id="btn-quick-add" class="success">快速添加行</button>
+            <button id="btn-add-case" class="success">新增用例</button>
+            <button id="btn-batch-delete" class="danger edit-mode-only">批量删除</button>
+            <button id="btn-merge-cells" class="secondary">合并单元格</button>
+            <button id="btn-unmerge-cells" class="secondary">取消合并</button>
+          </div>
+        </div>
+
+        <div class="table-wrapper" id="table-wrapper">
+          <table id="case-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="pagination" id="pagination"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 用例弹窗 -->
+  <div class="modal-overlay" id="case-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="case-modal-title">新增用例</h3>
+        <button class="close-btn" onclick="closeModal('#case-modal')">&times;</button>
+      </div>
+      <div class="modal-body" id="case-form-body"></div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="closeModal('#case-modal')">取消</button>
+        <button id="save-case-btn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 大文本编辑弹窗 -->
+  <div class="modal-overlay" id="cell-editor-modal">
+    <div class="modal cell-editor-modal">
+      <div class="modal-header">
+        <h3 id="cell-editor-title">编辑字段</h3>
+        <button class="close-btn" onclick="closeCellEditor()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="rich-format-toolbar"><button type="button" class="secondary" onmousedown="event.preventDefault()" onclick="toggleStrike()">删除线</button><span>选中文字后点击“删除线”，或按 Ctrl+Shift+X</span></div>
+        <div id="cell-editor-input" class="large-cell-editor rich-editor" contenteditable="true" role="textbox" aria-label="编辑内容" data-placeholder="请输入内容"></div>
+        <div class="cell-editor-attachments">
+          <button type="button" class="secondary paste-image-btn" onclick="pasteImageFromClipboard()">从剪贴板粘贴图片</button>
+          <span class="editor-tip">图片会自动保存到当前用例</span>
+          <div class="image-list" id="cell-image-list"></div>
+        </div>
+        <p class="editor-tip">支持多行内容；Ctrl+Enter 保存，Esc 取消</p>
+      </div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="closeCellEditor()">取消</button>
+        <button onclick="saveCellEditor()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 列设置弹窗 -->
+  <div class="modal-overlay" id="column-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>列设置</h3>
+        <button class="close-btn" onclick="closeModal('#column-modal')">&times;</button>
+      </div>
+      <div class="modal-body" id="column-form-body"></div>
+      <div class="modal-footer">
+        <button id="add-custom-column-btn" class="success">添加自定义列</button>
+        <button id="restore-default-columns-btn" class="secondary">一键整理（恢复默认排序）</button>
+        <button class="secondary" onclick="closeModal('#column-modal')">取消</button>
+        <button id="save-column-btn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 导入弹窗 -->
+  <div class="modal-overlay" id="import-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>导入用例</h3>
+        <button class="close-btn" onclick="closeModal('#import-modal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="import-dropzone" id="import-dropzone">
+          <p>拖拽 Excel 文件到此处，或点击上传</p>
+          <p style="font-size:12px;color:#909399">第一行作为表头自动识别列数；模块、标题、操作步骤、备注等标准字段会自动映射，其余列自动创建为自定义字段。用例编号为空时按顺序自动生成。</p>
+        </div>
+        <input type="file" id="import-file" accept=".xlsx,.xls" style="display:none">
+        <div class="progress-bar"><div class="progress-fill" id="import-progress"></div></div>
+        <div id="import-result" style="margin-top:10px;font-size:13px"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="closeModal('#import-modal')">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 总结结果弹窗 -->
+  <div class="modal-overlay" id="summary-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>执行总结</h3>
+        <button class="close-btn" onclick="closeModal('#summary-modal')">&times;</button>
+      </div>
+      <div class="modal-body" id="summary-body"></div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="closeModal('#summary-modal')">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 图片灯箱 -->
+  <div class="lightbox" id="lightbox">
+    <span class="lightbox-close" onclick="closeLightbox()">&times;</span>
+    <img id="lightbox-img" src="" alt="">
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script>
+    const BACKUP_DIR_DEFAULT = '/backups';
+    let lightboxScale = 1;
+    let lightboxOffset = {x: 0, y: 0};
+    let lightboxDrag = null;
+    async function createVersion() {
+      const name = prompt('请输入版本名称：');
+      if (!name) return;
+      try {
+        await api(`/api/projects/${state.currentProject.id}/versions`, {
+          method: 'POST',
+          body: JSON.stringify({ version_name: name })
+        });
+        await loadVersions();
+        showToast('版本创建成功');
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    function openLightbox(src) {
+      const box = $('#lightbox');
+      const img = $('#lightbox-img');
+      img.src = src;
+      lightboxScale = 1;
+      lightboxOffset = {x: 0, y: 0};
+      img.style.transform = 'translate(0, 0) scale(1)';
+      box.classList.add('active');
+    }
+
+    function updateLightboxImage() {
+      $('#lightbox-img').style.transform = `translate(${lightboxOffset.x}px, ${lightboxOffset.y}px) scale(${lightboxScale})`;
+    }
+
+    function closeLightbox() {
+      $('#lightbox').classList.remove('active');
+      $('#lightbox-img').src = '';
+    }
+
+    document.getElementById('lightbox-img').addEventListener('wheel', e => {
+      e.preventDefault();
+      lightboxScale = Math.min(4, Math.max(0.5, lightboxScale + (e.deltaY < 0 ? 0.15 : -0.15)));
+      updateLightboxImage();
+    }, {passive:false});
+    document.getElementById('lightbox-img').addEventListener('pointerdown', e => {
+      e.preventDefault();
+      lightboxDrag = {x:e.clientX, y:e.clientY, ox:lightboxOffset.x, oy:lightboxOffset.y};
+      e.currentTarget.setPointerCapture(e.pointerId);
+    });
+    document.getElementById('lightbox-img').addEventListener('pointermove', e => {
+      if(!lightboxDrag)return;
+      lightboxOffset.x = lightboxDrag.ox + e.clientX - lightboxDrag.x;
+      lightboxOffset.y = lightboxDrag.oy + e.clientY - lightboxDrag.y;
+      updateLightboxImage();
+    });
+    document.getElementById('lightbox-img').addEventListener('pointerup', () => {lightboxDrag=null;});
+  </script>
+  <script src="/static/js/app.js?v=20260827-15"></script>
+</body>
+</html>
