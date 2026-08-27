@@ -1023,6 +1023,21 @@ async function backupDb(){
   try{const body=path?JSON.stringify({backup_dir:path}):JSON.stringify({});const res=await api('/api/backup',{method:'POST',body:body});showToast(`备份已保存：${res.data.path}`);}catch(err){showToast(err.message,'error');}
 }
 
+async function exportCurrentVersionExcel(){
+  if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}
+  const url=`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/export`;
+  try{
+    showToast('正在生成 Excel，请稍候');
+    const res=await fetch(url);
+    if(!res.ok){const data=await res.json().catch(()=>({}));throw new Error(data.message||`导出失败 ${res.status}`);}
+    const blob=await res.blob();
+    const objectUrl=URL.createObjectURL(blob);
+    const link=document.createElement('a');link.href=objectUrl;link.download=`${state.currentProject.name}_${state.currentVersion.version_name}_用例.xlsx`;
+    document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(objectUrl);
+    showToast('Excel 下载成功');
+  }catch(err){showToast(err.message,'error');}
+}
+
 // 图片粘贴上传（弹窗内任意位置，包括备注框）
 function isImageFile(file){return !!file&&(file.type?.startsWith('image/')||/\.(png|jpe?g|gif|bmp|webp)$/i.test(file.name||''));}
 function getPastedImageFiles(event){
@@ -1194,6 +1209,7 @@ $('#btn-add-project').onclick=createProject;
 $('#btn-add-case').onclick=addCase;
 $('#btn-import').onclick=openImportModal;
 $('#btn-columns').onclick=openColumnModal;
+$('#btn-export-excel').onclick=exportCurrentVersionExcel;
 $('#btn-backup').onclick=backupDb;
 $('#btn-search').onclick=()=>{state.keyword=$('#search-input').value;state.page=1;loadCases();};
 $('#search-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('#btn-search').click();});

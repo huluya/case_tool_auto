@@ -14,6 +14,13 @@ from flask import Flask, request, jsonify, send_file, render_template
 from sqlalchemy import create_engine, text
 from werkzeug.utils import secure_filename
 import openpyxl
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+from openpyxl.drawing.xdr import XDRPositiveSize2D
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.worksheet.cell_range import CellRange
 
 import config
@@ -551,6 +558,171 @@ def get_cases(project_id, version_id):
         'merges': [merge.to_dict() for merge in merges]
     }
     return jsonify({'success': True, 'data': data})
+
+
+def rich_value_to_excel_text(value):
+    """把备注/富文本字段转换为 Excel 可读文本，并保留图片占位符。"""
+    raw = str(value or '')
+    if not raw:
+        return ''
+    if not re.search(r'<(?:img|br|div|p|s|strike|del)\b', raw, re.IGNORECASE):
+        return html.unescape(raw)
+    text_value = re.sub(r'<img\b[^>]*>', '[图片]', raw, flags=re.IGNORECASE)
+    text_value = re.sub(r'<br\s*/?>', '\n', text_value, flags=re.IGNORECASE)
+    text_value = re.sub(r'</(?:div|p|li)>', '\n', text_value, flags=re.IGNORECASE)
+    text_value = re.sub(r'<[^>]+>', '', text_value)
+    return html.unescape(text_value).strip()
+
+
+def export_column_value(case, column):
+    if column.is_system:
+        return getattr(case, column.key, '')
+    return (case.get_custom_fields() or {}).get(column.key, '')
+
+
+def export_sheet_title(name):
+    title = re.sub(r'[\\/*?:\[\]]', '_', str(name or '')).strip()[:31]
+    return title or '用例列表'
+
+
+def add_excel_image_in_cell(worksheet, image_data, row_index, column_index, image_index):
+    """将图片以单元格锚点方式放入主表对应单元格。"""
+    embedded = ExcelImage(io.BytesIO(bytes(image_data)))
+    max_width, max_height = 96, 70
+    scale = min(max_width / embedded.width, max_height / embedded.height, 1)
+    width = max(1, int(embedded.width * scale))
+    height = max(1, int(embedded.height * scale))
+    column_offset = (image_index % 2) * 102 + 4
+    row_offset = (image_index // 2) * 78 + 4
+    embedded.width = width
+    embedded.height = height
+    embedded.anchor = OneCellAnchor(
+        _from=AnchorMarker(
+            col=column_index - 1,
+            colOff=pixels_to_EMU(column_offset),
+            row=row_index - 1,
+            rowOff=pixels_to_EMU(row_offset),
+        ),
+        ext=XDRPositiveSize2D(cx=pixels_to_EMU(width), cy=pixels_to_EMU(height)),
+    )
+    worksheet.add_image(embedded)
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/export', methods=['GET'])
+def export_version_excel(project_id, version_id):
+    """导出当前版本的可见列、用例、合并关系和单元格内图片。"""
+    version = Version.query.filter_by(id=version_id, project_id=project_id).first()
+    project = Project.query.get(project_id)
+    if not version or not project:
+        return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
+
+    init_system_columns(project_id)
+    columns = CustomColumn.query.filter_by(project_id=project_id, is_visible=True) \
+        .order_by(CustomColumn.sort_order.asc(), CustomColumn.id.asc()).all()
+    cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id) \
+        .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
+    merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version_id).all()
+
+    workbook = Workbook()
+    sheet_title = export_sheet_title(version.version_name)
+    if sheet_title == '图片附件':
+        sheet_title = '用例列表'
+    worksheet = workbook.active
+    worksheet.title = sheet_title
+    worksheet.freeze_panes = 'A2'
+    worksheet.sheet_view.showGridLines = False
+
+    header_fill = PatternFill('solid', fgColor='409EFF')
+    header_font = Font(name='Microsoft YaHei', size=11, bold=True, color='FFFFFF')
+    body_font = Font(name='Microsoft YaHei', size=10, color='1F2937')
+    strike_font = Font(name='Microsoft YaHei', size=10, color='1F2937', strike=True)
+    border = Border(
+        left=Side(style='thin', color='D9E2F3'),
+        right=Side(style='thin', color='D9E2F3'),
+        top=Side(style='thin', color='D9E2F3'),
+        bottom=Side(style='thin', color='D9E2F3'),
+    )
+    status_colors = {
+        '通过': '67C23A',
+        '失败': 'F56C6C',
+        '未执行': '909399',
+        '阻塞': 'E6A23C',
+        '跳过': '409EFF',
+    }
+
+    for column_index, column in enumerate(columns, start=1):
+        header = worksheet.cell(row=1, column=column_index, value=column.name)
+        header.fill = header_fill
+        header.font = header_font
+        header.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        header.border = border
+        # Web 端宽度是像素，Excel 列宽使用近似字符数。
+        worksheet.column_dimensions[get_column_letter(column_index)].width = max(
+            10, min(60, round((column.width or 120) / 7, 1))
+        )
+    worksheet.row_dimensions[1].height = 28
+
+    case_row_map = {}
+    column_index_map = {column.key: index for index, column in enumerate(columns, start=1)}
+    image_column_index = column_index_map.get('remark') or (len(columns) if columns else None)
+    for row_index, case in enumerate(cases, start=2):
+        case_row_map[case.id] = row_index
+        images = [image for image in case.images if image.image_data]
+        has_image = bool(images)
+        for column_index, column in enumerate(columns, start=1):
+            raw_value = export_column_value(case, column)
+            cell_value = rich_value_to_excel_text(raw_value)
+            if column.key == 'remark' and has_image:
+                # 图片直接锚定在备注单元格中，不再输出占位文字或附件工作表提示。
+                cell_value = re.sub(r'\[图片\]', '', cell_value).strip()
+            cell = worksheet.cell(row=row_index, column=column_index, value=cell_value)
+            cell.border = border
+            cell.alignment = Alignment(vertical='top', wrap_text=True)
+            cell.font = strike_font if re.search(r'<(?:s|strike|del)\b', str(raw_value or ''), re.IGNORECASE) else body_font
+            if column.key == 'status':
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                status = normalize_status(raw_value)
+                cell.font = Font(name='Microsoft YaHei', size=10, color=status_colors.get(status, '1F2937'))
+        worksheet.row_dimensions[row_index].height = max(42, min(240, 78 * ((len(images) + 1) // 2)))
+        if image_column_index:
+            for image_index, image in enumerate(images):
+                try:
+                    add_excel_image_in_cell(worksheet, image.image_data, row_index, image_column_index, image_index)
+                except Exception:
+                    # 单张图片损坏时不影响其他用例导出。
+                    continue
+
+    if cases and columns:
+        worksheet.auto_filter.ref = f'A1:{get_column_letter(len(columns))}{len(cases) + 1}'
+
+    # 将当前版本的纵向合并关系还原到导出表格，隐藏列对应的合并自然跳过。
+    for merge in merges:
+        rows = [case_row_map[case_id] for case_id in merge.get_case_ids() if case_id in case_row_map]
+        column_index = column_index_map.get(merge.column_key)
+        if not column_index or len(rows) < 2:
+            continue
+        start_row, end_row = min(rows), max(rows)
+        if sorted(rows) != list(range(start_row, end_row + 1)):
+            continue
+        worksheet.merge_cells(
+            start_row=start_row,
+            start_column=column_index,
+            end_row=end_row,
+            end_column=column_index,
+        )
+        merged_cell = worksheet.cell(row=start_row, column=column_index)
+        merged_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    download_name = f'{project.name}_{version.version_name}_用例.xlsx'
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
 
 
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/cases/reset-numbers', methods=['POST'])
