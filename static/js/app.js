@@ -487,7 +487,7 @@ function richTextHtml(value){
     });
     if(node.tagName==='IMG'){
       const src=node.getAttribute('src')||'';
-      if(!src.startsWith('/uploads/'))node.remove();
+      if(!src.startsWith('/uploads/')&&!src.startsWith('/api/images/'))node.remove();
       else{
         node.setAttribute('class','rich-content-image');
         node.setAttribute('alt',node.getAttribute('alt')||'图片');
@@ -697,7 +697,12 @@ async function loadCaseImages(caseId){
   const res=await api(`/api/cases/${caseId}/images`);state.caseImages=res.data||[];renderImageList();
 }
 
-function getImageSrc(img){return img.previewUrl||('/uploads/'+img.file_path.split('/').slice(-2).join('/'));}
+function getImageSrc(img){
+  if(img.previewUrl)return img.previewUrl;
+  if(img.content_url)return img.content_url;
+  if(img.file_path)return '/uploads/'+img.file_path.split('/').slice(-2).join('/');
+  return '';
+}
 function renderImageList(){
   renderImageListInto($('#image-list'),state.editingCase?.id);
   renderImageListInto($('#cell-image-list'),state.editingCell?.caseId);
