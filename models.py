@@ -168,7 +168,7 @@ class CaseImage(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     test_case_id = db.Column(db.Integer, db.ForeignKey('test_cases.id'), nullable=False)
     filename = db.Column(db.String(255), nullable=False)
-    # 新图片直接保存到数据库；file_path 仅保留给历史文件图片做兼容读取。
+    # image_data 保存图片本体；file_path 仅作为旧数据库结构中的遗留字段保留，应用不再使用。
     file_path = db.Column(db.String(500), nullable=False, default='')
     image_data = db.Column(LONGBLOB, nullable=True)
     mime_type = db.Column(db.String(100), nullable=False, default='application/octet-stream')
@@ -179,7 +179,6 @@ class CaseImage(db.Model):
             'id': self.id,
             'test_case_id': self.test_case_id,
             'filename': self.filename,
-            'file_path': self.file_path.replace('\\', '/') if self.file_path else '',
             'mime_type': self.mime_type or 'application/octet-stream',
             'content_url': f'/api/images/{self.id}/content',
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,

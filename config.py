@@ -12,8 +12,7 @@ DB_USER = os.getenv('DB_USER', 'root')
 DB_PASSWORD = os.getenv('DB_PASSWORD', '123456')
 DB_NAME = os.getenv('DB_NAME', 'case_manager')
 
-# 上传与备份目录
-UPLOAD_DIR = os.getenv('UPLOAD_DIR', os.path.join(BASE_DIR, 'uploads'))
+# 数据库备份目录
 BACKUP_DIR = os.getenv('BACKUP_DIR', os.path.join(BASE_DIR, 'backups'))
 
 # 项目删除密码
@@ -25,7 +24,6 @@ USERS = {
     'test': os.getenv('TEST_PASSWORD', '123456'),
 }
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 SQLALCHEMY_DATABASE_URI = (

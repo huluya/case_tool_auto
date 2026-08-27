@@ -487,7 +487,7 @@ function richTextHtml(value){
     });
     if(node.tagName==='IMG'){
       const src=node.getAttribute('src')||'';
-      if(!src.startsWith('/uploads/')&&!src.startsWith('/api/images/'))node.remove();
+      if(!src.startsWith('/api/images/'))node.remove();
       else{
         node.setAttribute('class','rich-content-image');
         node.setAttribute('alt',node.getAttribute('alt')||'图片');
@@ -700,7 +700,6 @@ async function loadCaseImages(caseId){
 function getImageSrc(img){
   if(img.previewUrl)return img.previewUrl;
   if(img.content_url)return img.content_url;
-  if(img.file_path)return '/uploads/'+img.file_path.split('/').slice(-2).join('/');
   return '';
 }
 function renderImageList(){

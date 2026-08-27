@@ -4,15 +4,13 @@ import json
 import html
 import shutil
 import subprocess
-import uuid
 import re
 import posixpath
-import mimetypes
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 from datetime import datetime
 
-from flask import Flask, request, jsonify, send_file, send_from_directory, render_template
+from flask import Flask, request, jsonify, send_file, render_template
 from sqlalchemy import create_engine, text
 from werkzeug.utils import secure_filename
 import openpyxl
@@ -140,14 +138,6 @@ def delete_project(project_id):
         return jsonify({'success': False, 'message': '删除密码错误'}), 403
 
     project = Project.query.get_or_404(project_id)
-    # 删除关联图片文件
-    for case in project.cases:
-        for img in case.images:
-            try:
-                if os.path.exists(img.file_path):
-                    os.remove(img.file_path)
-            except Exception:
-                pass
     db.session.delete(project)
     db.session.commit()
     return jsonify({'success': True})
@@ -219,18 +209,12 @@ def copy_version(project_id, version_id):
             case_id_map[source_case.id] = copied_case.id
 
             for source_image in source_case.images:
-                # 新图片来自数据库；历史图片如果仍在 uploads 中，则在复制版本时
-                # 自动读入数据库，避免新版本继续依赖文件夹。
                 image_data = source_image.image_data
-                if not image_data and source_image.file_path and os.path.exists(source_image.file_path):
-                    with open(source_image.file_path, 'rb') as image_file:
-                        image_data = image_file.read()
                 if not image_data:
                     continue
                 copied_image = CaseImage(
                     test_case_id=copied_case.id,
                     filename=source_image.filename,
-                    file_path='',
                     image_data=image_data,
                     mime_type=source_image.mime_type or 'application/octet-stream',
                 )
@@ -239,23 +223,14 @@ def copy_version(project_id, version_id):
 
         db.session.flush()
         for copied_case, source_image, copied_image in image_replacements:
-            old_paths = {f'/api/images/{source_image.id}/content'}
-            if source_image.file_path:
-                try:
-                    old_relative = os.path.relpath(source_image.file_path, config.UPLOAD_DIR).replace(os.sep, '/')
-                    old_paths.add(f'/uploads/{old_relative}')
-                except ValueError:
-                    pass
             new_src = f'/api/images/{copied_image.id}/content'
             tag_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
 
-            def replace_image_tag(match, old_id=source_image.id, paths=old_paths, new_id=copied_image.id, src=new_src):
+            def replace_image_tag(match, old_id=source_image.id, new_id=copied_image.id, src=new_src):
                 tag = match.group(0)
                 has_id = re.search(r'data-image-id\s*=\s*["\']' + str(old_id) + r'["\']', tag, re.IGNORECASE)
-                if not has_id and not any(path in tag for path in paths):
-                    return tag
                 if not has_id:
-                    tag = re.sub(r'(<img\b)', r'\1 data-image-id="' + str(new_id) + r'"', tag, count=1, flags=re.IGNORECASE)
+                    return tag
                 tag = re.sub(
                     r'(data-image-id\s*=\s*["\'])\d+(["\'])',
                     lambda m: m.group(1) + str(new_id) + m.group(2), tag, flags=re.IGNORECASE
@@ -341,14 +316,6 @@ def delete_version(project_id, version_id):
         return jsonify({'success': False, 'message': '删除密码错误'}), 403
 
     version = Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
-    # 删除关联图片文件
-    for case in version.cases:
-        for img in case.images:
-            try:
-                if os.path.exists(img.file_path):
-                    os.remove(img.file_path)
-            except Exception:
-                pass
     db.session.delete(version)
     db.session.commit()
     return jsonify({'success': True})
@@ -743,13 +710,6 @@ def update_case(case_id):
 @app.route('/api/cases/<int:case_id>', methods=['DELETE'])
 def delete_case(case_id):
     case = TestCase.query.get_or_404(case_id)
-    # 删除图片文件
-    for img in case.images:
-        try:
-            if os.path.exists(img.file_path):
-                os.remove(img.file_path)
-        except Exception:
-            pass
     for merge in CaseMerge.query.filter_by(project_id=case.project_id, version_id=case.version_id).all():
         remaining_ids = [value for value in merge.get_case_ids() if value != case.id]
         if len(remaining_ids) < 2:
@@ -773,12 +733,6 @@ def delete_cases_batch():
         return jsonify({'success': False, 'message': '用例编号格式错误'}), 400
     cases = TestCase.query.filter(TestCase.id.in_(case_ids)).all() if case_ids else []
     for case in cases:
-        for img in case.images:
-            try:
-                if os.path.exists(img.file_path):
-                    os.remove(img.file_path)
-            except Exception:
-                pass
         for merge in CaseMerge.query.filter_by(project_id=case.project_id, version_id=case.version_id).all():
             remaining_ids = [value for value in merge.get_case_ids() if value != case.id]
             if len(remaining_ids) < 2:
@@ -1278,7 +1232,6 @@ def upload_image(case_id):
         img = CaseImage(
             test_case_id=case_id,
             filename=file.filename,
-            file_path='',
             image_data=image_data,
             mime_type=file.mimetype or 'application/octet-stream',
         )
@@ -1297,12 +1250,6 @@ def get_images(case_id):
 @app.route('/api/images/<int:image_id>', methods=['DELETE'])
 def delete_image(image_id):
     img = CaseImage.query.get_or_404(image_id)
-    try:
-        # 兼容删除旧版本中仍保存在 uploads 的图片；新图片没有物理文件。
-        if img.file_path and os.path.exists(img.file_path):
-            os.remove(img.file_path)
-    except Exception:
-        pass
     db.session.delete(img)
     db.session.commit()
     return jsonify({'success': True})
@@ -1310,7 +1257,7 @@ def delete_image(image_id):
 
 @app.route('/api/images/<int:image_id>/content', methods=['GET'])
 def serve_image_content(image_id):
-    """从数据库读取图片；历史图片仍可从旧的 uploads 路径读取。"""
+    """从 MySQL 读取图片本体。"""
     img = CaseImage.query.get_or_404(image_id)
     if img.image_data:
         return send_file(
@@ -1319,19 +1266,7 @@ def serve_image_content(image_id):
             download_name=img.filename or 'image',
             max_age=31536000,
         )
-    if img.file_path and os.path.isfile(img.file_path):
-        return send_file(
-            img.file_path,
-            mimetype=img.mime_type or None,
-            download_name=img.filename or os.path.basename(img.file_path),
-            max_age=31536000,
-        )
     return jsonify({'success': False, 'message': '图片内容不存在'}), 404
-
-
-@app.route('/uploads/<path:filename>')
-def serve_upload(filename):
-    return send_from_directory(config.UPLOAD_DIR, filename)
 
 
 # ------------------- 数据库备份 -------------------
@@ -1418,8 +1353,7 @@ def migrate_sort_order():
                 version_sort_added = True
             except Exception:
                 pass  # 字段已存在
-            # 新上传图片保存为 MySQL LONGBLOB；旧数据的 file_path 保留，
-            # 这样升级后历史图片仍能显示，并可在版本复制时自动迁入数据库。
+            # 新上传图片保存为 MySQL LONGBLOB。
             for column, definition in (
                 ('image_data', "LONGBLOB NULL"),
                 ('mime_type', "VARCHAR(100) NOT NULL DEFAULT 'application/octet-stream'"),
@@ -1437,64 +1371,8 @@ def migrate_sort_order():
                     conn.execute(text("UPDATE versions SET sort_order = :sort_order WHERE id = :id"),
                                  {'sort_order': offset, 'id': row[0]})
             conn.commit()
-        migrate_legacy_images_to_database()
     except Exception as e:
         print('sort_order 迁移提示:', e)
-
-
-def migrate_legacy_images_to_database():
-    """把升级前保存在 uploads 的图片迁入数据库，并更新备注中的图片地址。"""
-    legacy_images = CaseImage.query.filter(
-        CaseImage.file_path.isnot(None),
-        CaseImage.file_path != '',
-        CaseImage.image_data.is_(None),
-    ).all()
-    if not legacy_images:
-        return
-
-    tag_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
-    migrated = 0
-    for image in legacy_images:
-        if not os.path.isfile(image.file_path):
-            continue
-        try:
-            with open(image.file_path, 'rb') as image_file:
-                image.image_data = image_file.read()
-            guessed_type, _ = mimetypes.guess_type(image.filename or image.file_path)
-            if not image.mime_type or image.mime_type == 'application/octet-stream':
-                image.mime_type = guessed_type or 'application/octet-stream'
-            old_paths = set()
-            try:
-                old_relative = os.path.relpath(image.file_path, config.UPLOAD_DIR).replace(os.sep, '/')
-                old_paths.add(f'/uploads/{old_relative}')
-            except ValueError:
-                pass
-            new_src = f'/api/images/{image.id}/content'
-            case = image.case
-
-            def replace_legacy_tag(match, image_id=image.id, paths=old_paths, src=new_src):
-                tag = match.group(0)
-                has_id = re.search(r'data-image-id\s*=\s*["\']' + str(image_id) + r'["\']', tag, re.IGNORECASE)
-                if not has_id and not any(path in tag for path in paths):
-                    return tag
-                if not has_id:
-                    tag = re.sub(r'(<img\b)', r'\1 data-image-id="' + str(image_id) + r'"', tag, count=1, flags=re.IGNORECASE)
-                return re.sub(
-                    r'(src\s*=\s*["\'])[^"\']*(["\'])',
-                    lambda match: match.group(1) + src + match.group(2),
-                    tag,
-                    flags=re.IGNORECASE,
-                )
-
-            if case and case.remark:
-                case.remark = tag_pattern.sub(replace_legacy_tag, case.remark)
-            migrated += 1
-        except Exception as exc:
-            print(f'图片迁移提示（ID {image.id}）:', exc)
-
-    if migrated:
-        db.session.commit()
-        print(f'已将 {migrated} 张历史图片迁入 MySQL')
 
 
 if __name__ == '__main__':
