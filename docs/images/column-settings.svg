@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720">
+  <rect width="1120" height="720" fill="#f5f7fa"/>
+  <rect x="190" y="28" width="740" height="664" rx="9" fill="#ffffff" stroke="#dcdfe6"/>
+  <rect x="190" y="28" width="740" height="62" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="222" y="68" font-size="22" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">列设置</text>
+  <text x="700" y="67" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">拖动调整顺序</text>
+  <g font-family="Microsoft YaHei,Arial,sans-serif" font-size="15" fill="#606266">
+    <rect x="216" y="108" width="688" height="50" fill="#f5f7fa"/><text x="230" y="140">⋮⋮</text><text x="278" y="140">显示</text><text x="350" y="140">字段名称</text><text x="690" y="140">类型</text><text x="790" y="140">操作</text>
+  </g>
+  <g font-family="Microsoft YaHei,Arial,sans-serif" font-size="15" fill="#303133">
+    <g><text x="230" y="190">⋮⋮</text><rect x="278" y="173" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="190">用例编号</text><text x="690" y="190" fill="#909399">系统列</text><rect x="770" y="166" width="112" height="30" rx="4" fill="#909399"/><text x="789" y="187" fill="#ffffff" font-size="13">重置编号</text></g>
+    <g><text x="230" y="240">⋮⋮</text><rect x="278" y="223" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="240">模块</text><text x="690" y="240" fill="#909399">系统列</text></g>
+    <g><text x="230" y="290">⋮⋮</text><rect x="278" y="273" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="290">标题</text><text x="690" y="290" fill="#909399">系统列</text></g>
+    <g><text x="230" y="340">⋮⋮</text><rect x="278" y="323" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="340">前置条件</text><text x="690" y="340" fill="#909399">系统列</text></g>
+    <g><text x="230" y="390">⋮⋮</text><rect x="278" y="373" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="390">操作步骤</text><text x="690" y="390" fill="#909399">系统列</text></g>
+    <g><text x="230" y="440">⋮⋮</text><rect x="278" y="423" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="440">预期结果</text><text x="690" y="440" fill="#909399">系统列</text></g>
+    <g><text x="230" y="490">⋮⋮</text><rect x="278" y="473" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="490">优先级</text><text x="690" y="490" fill="#909399">系统列</text></g>
+    <g><text x="230" y="540">⋮⋮</text><rect x="278" y="523" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="540">执行结果</text><text x="690" y="540" fill="#909399">系统列</text><rect x="770" y="516" width="112" height="30" rx="4" fill="#909399"/><text x="785" y="537" fill="#ffffff" font-size="13">重置测试结果</text></g>
+    <g><text x="230" y="590">⋮⋮</text><rect x="278" y="573" width="18" height="18" rx="3" fill="#409eff"/><text x="350" y="590">备注</text><text x="690" y="590" fill="#909399">系统列</text></g>
+  </g>
+  <rect x="216" y="616" width="164" height="38" rx="4" fill="#67c23a"/><text x="245" y="641" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">添加自定义列</text>
+  <rect x="394" y="616" width="250" height="38" rx="4" fill="#909399"/><text x="420" y="641" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">一键整理（恢复默认排序）</text>
+  <text x="660" y="641" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">未勾选列跳过，自定义列保留</text>
+</svg>

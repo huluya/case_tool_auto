@@ -1,23 +1,26 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560">
-  <rect width="1000" height="560" fill="#f5f7fa"/>
-  <rect x="80" y="32" width="840" height="496" rx="8" fill="#ffffff" stroke="#dcdfe6"/>
-  <rect x="80" y="32" width="840" height="58" fill="#ffffff" stroke="#dcdfe6"/>
-  <text x="108" y="69" font-size="20" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">编辑：备注</text>
-  <rect x="108" y="110" width="784" height="42" rx="5" fill="#f5f7fa" stroke="#dcdfe6"/>
-  <rect x="124" y="118" width="82" height="26" rx="4" fill="#909399"/>
-  <text x="141" y="136" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">删除线</text>
-  <text x="222" y="136" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">选中文字后可设置格式</text>
-  <rect x="108" y="168" width="784" height="255" rx="5" fill="#ffffff" stroke="#409eff" stroke-width="2"/>
-  <text x="132" y="208" font-size="17" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">用户点击头像后进入图片选择页面。</text>
-  <text x="132" y="241" font-size="17" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">上传成功后显示以下示例图片：</text>
-  <rect x="132" y="263" width="220" height="112" rx="6" fill="#d9ecff" stroke="#409eff"/>
-  <circle cx="188" cy="304" r="24" fill="#67c23a"/>
-  <path d="M173 308 L185 296 L196 307 L205 298 L224 320 L168 320 Z" fill="#ffffff"/>
-  <text x="225" y="329" font-size="16" font-family="Microsoft YaHei,Arial,sans-serif" fill="#409eff">示例图片</text>
-  <text x="378" y="303" font-size="17" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">图片后仍可继续输入文字。</text>
-  <text x="378" y="338" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">图片来自虚构测试数据</text>
-  <text x="132" y="405" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">文字、图片可以在同一个备注输入框中混排</text>
-  <rect x="108" y="449" width="170" height="34" rx="4" fill="#909399"/>
-  <text x="133" y="471" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">从剪贴板粘贴图片</text>
-  <text x="300" y="471" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">粘贴后自动保存并显示缩略图</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <rect width="1200" height="700" fill="#f5f7fa"/>
+  <rect x="70" y="34" width="1060" height="632" rx="9" fill="#ffffff" stroke="#dcdfe6"/>
+  <rect x="70" y="34" width="1060" height="62" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="102" y="74" font-size="21" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">编辑：备注</text>
+  <text x="850" y="73" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">用例 TC-001 · 示例数据</text>
+  <rect x="102" y="120" width="996" height="48" rx="5" fill="#f5f7fa" stroke="#dcdfe6"/>
+  <rect x="120" y="129" width="82" height="30" rx="4" fill="#909399"/>
+  <text x="138" y="150" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">删除线</text>
+  <text x="222" y="150" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">选中文字后设置格式，Ctrl+V 粘贴图片</text>
+  <rect x="102" y="188" width="996" height="318" rx="6" fill="#ffffff" stroke="#409eff" stroke-width="2"/>
+  <text x="132" y="230" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">用户点击头像后进入图片选择页面。</text>
+  <text x="132" y="267" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">上传成功后显示示例图片：</text>
+  <rect x="132" y="292" width="258" height="144" rx="7" fill="#d9ecff" stroke="#409eff"/>
+  <circle cx="204" cy="348" r="31" fill="#67c23a"/>
+  <path d="M183 354 L201 335 L215 349 L227 338 L255 372 L176 372 Z" fill="#ffffff"/>
+  <text x="274" y="355" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" fill="#409eff">示例图片</text>
+  <text x="430" y="338" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">图片后可以继续输入文字。</text>
+  <text x="430" y="378" font-size="16" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">单击或双击缩略图可查看大图</text>
+  <text x="132" y="474" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">删除图片：选中图片按 Delete，保存后同步删除数据库记录</text>
+  <rect x="102" y="532" width="220" height="38" rx="4" fill="#909399"/>
+  <text x="131" y="557" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">从剪贴板粘贴图片</text>
+  <text x="344" y="557" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">图片保存在 MySQL，不写入 uploads</text>
+  <rect x="102" y="600" width="996" height="38" rx="4" fill="#f0f9eb"/>
+  <text x="130" y="625" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#67c23a">文字与图片在同一个输入框中混排，截图内容为虚构示例</text>
 </svg>
