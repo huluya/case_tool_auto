@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="540" viewBox="0 0 1200 540">
+  <rect width="1200" height="540" fill="#ffffff"/>
+  <rect width="1200" height="58" fill="#217346"/>
+  <text x="24" y="37" font-size="20" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#ffffff">Excel 示例用例表</text>
+  <text x="1010" y="36" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#d9f2df">虚构测试数据</text>
+  <rect x="24" y="82" width="1150" height="54" fill="#d9ead3" stroke="#a9c49a"/>
+  <text x="46" y="116" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#274e13">用例编号</text>
+  <text x="190" y="116" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#274e13">模块</text>
+  <text x="330" y="116" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#274e13">标题</text>
+  <text x="665" y="116" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#274e13">操作步骤</text>
+  <text x="980" y="116" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#274e13">预期结果</text>
+  <line x1="24" y1="190" x2="1174" y2="190" stroke="#b7b7b7"/>
+  <line x1="24" y1="282" x2="1174" y2="282" stroke="#b7b7b7"/>
+  <line x1="24" y1="374" x2="1174" y2="374" stroke="#b7b7b7"/>
+  <line x1="24" y1="466" x2="1174" y2="466" stroke="#b7b7b7"/>
+  <line x1="160" y1="82" x2="160" y2="466" stroke="#b7b7b7"/>
+  <line x1="300" y1="82" x2="300" y2="466" stroke="#b7b7b7"/>
+  <line x1="635" y1="82" x2="635" y2="466" stroke="#b7b7b7"/>
+  <line x1="950" y1="82" x2="950" y2="466" stroke="#b7b7b7"/>
+  <text x="54" y="170" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">TC-001</text>
+  <text x="190" y="170" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">账户</text>
+  <text x="330" y="170" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">登录成功</text>
+  <text x="665" y="170" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">输入正确账号密码</text>
+  <text x="980" y="170" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">进入首页</text>
+  <text x="54" y="262" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">TC-002</text>
+  <text x="190" y="262" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">账户</text>
+  <text x="330" y="262" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">旧登录入口</text>
+  <line x1="330" y1="255" x2="425" y2="255" stroke="#333333" stroke-width="2"/>
+  <text x="665" y="262" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">点击旧入口</text>
+  <line x1="665" y1="255" x2="760" y2="255" stroke="#333333" stroke-width="2"/>
+  <text x="980" y="262" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">不再使用</text>
+  <line x1="980" y1="255" x2="1055" y2="255" stroke="#333333" stroke-width="2"/>
+  <text x="54" y="354" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">TC-003</text>
+  <text x="190" y="354" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">账户</text>
+  <text x="330" y="354" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">验证码校验</text>
+  <text x="665" y="354" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">输入错误验证码</text>
+  <text x="980" y="354" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#333333">提示错误</text>
+  <text x="44" y="505" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#666666">删除线为虚构示例，用于说明导入后保留 Excel 格式</text>
+</svg>

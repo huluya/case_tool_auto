@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="520" viewBox="0 0 1000 520">
+  <rect width="1000" height="520" fill="#f5f7fa"/>
+  <rect width="1000" height="58" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="28" y="36" font-size="22" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">用例管理平台</text>
+  <text x="360" y="35" font-size="16" font-family="Microsoft YaHei,Arial,sans-serif" fill="#606266">示例数据环境</text>
+  <rect x="0" y="58" width="280" height="462" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="24" y="92" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">项目列表</text>
+  <rect x="200" y="70" width="58" height="30" rx="4" fill="#409eff"/>
+  <text x="214" y="91" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">新建</text>
+  <rect x="14" y="116" width="250" height="92" rx="7" fill="#ecf5ff"/>
+  <text x="28" y="146" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#409eff">▼ 会员中心</text>
+  <text x="48" y="177" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#606266">v2.4.0 回归测试</text>
+  <text x="48" y="199" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#409eff">v2.3.1 稳定版</text>
+  <rect x="14" y="220" width="250" height="64" rx="7" fill="#ffffff"/>
+  <text x="28" y="249" font-size="15" font-family="Microsoft YaHei,Arial,sans-serif" fill="#606266">▶ 订单服务</text>
+  <text x="48" y="273" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">v1.8.0</text>
+  <rect x="306" y="78" width="664" height="66" rx="7" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="330" y="108" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">会员中心 / v2.3.1 稳定版</text>
+  <text x="330" y="130" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">项目和版本名称均为虚构示例</text>
+  <rect x="306" y="160" width="664" height="306" rx="7" fill="#ffffff" stroke="#dcdfe6"/>
+  <rect x="306" y="160" width="664" height="44" fill="#f5f7fa"/>
+  <text x="332" y="188" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">用例编号</text>
+  <text x="442" y="188" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">模块</text>
+  <text x="550" y="188" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">标题</text>
+  <text x="830" y="188" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">执行结果</text>
+  <line x1="306" y1="248" x2="970" y2="248" stroke="#ebeef5"/>
+  <line x1="306" y1="292" x2="970" y2="292" stroke="#ebeef5"/>
+  <line x1="306" y1="336" x2="970" y2="336" stroke="#ebeef5"/>
+  <line x1="306" y1="380" x2="970" y2="380" stroke="#ebeef5"/>
+  <text x="340" y="232" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">1</text>
+  <text x="442" y="232" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">登录</text>
+  <text x="550" y="232" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">手机号登录成功</text>
+  <text x="830" y="232" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#67c23a">通过</text>
+  <text x="340" y="276" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">2</text>
+  <text x="442" y="276" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">会员</text>
+  <text x="550" y="276" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">查看会员权益</text>
+  <text x="830" y="276" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">未执行</text>
+  <text x="340" y="320" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">3</text>
+  <text x="442" y="320" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">积分</text>
+  <text x="550" y="320" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">积分明细展示</text>
+  <text x="830" y="320" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#f56c6c">失败</text>
+  <text x="332" y="435" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">示例数据截图 · 不含真实业务数据</text>
+</svg>

@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560">
+  <rect width="1200" height="560" fill="#f5f7fa"/>
+  <rect width="1200" height="62" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="28" y="39" font-size="22" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">用例管理平台</text>
+  <rect x="825" y="17" width="108" height="30" rx="15" fill="#409eff"/>
+  <circle cx="916" cy="32" r="11" fill="#ffffff"/>
+  <text x="720" y="38" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#606266">编辑模式</text>
+  <rect x="24" y="84" width="1152" height="62" rx="7" fill="#ffffff" stroke="#dcdfe6"/>
+  <text x="48" y="122" font-size="18" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#303133">会员中心 / v2.4.0 回归测试</text>
+  <rect x="916" y="101" width="94" height="32" rx="4" fill="#67c23a"/>
+  <text x="936" y="122" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">批量删除</text>
+  <rect x="1024" y="101" width="126" height="32" rx="4" fill="#909399"/>
+  <text x="1042" y="122" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">列设置</text>
+  <rect x="24" y="164" width="1152" height="304" rx="7" fill="#ffffff" stroke="#dcdfe6"/>
+  <rect x="24" y="164" width="1152" height="46" fill="#f5f7fa"/>
+  <line x1="24" y1="210" x2="1176" y2="210" stroke="#ebeef5"/>
+  <line x1="24" y1="275" x2="1176" y2="275" stroke="#ebeef5"/>
+  <line x1="24" y1="340" x2="1176" y2="340" stroke="#ebeef5"/>
+  <line x1="24" y1="405" x2="1176" y2="405" stroke="#ebeef5"/>
+  <line x1="80" y1="164" x2="80" y2="468" stroke="#ebeef5"/>
+  <line x1="200" y1="164" x2="200" y2="468" stroke="#ebeef5"/>
+  <line x1="360" y1="164" x2="360" y2="468" stroke="#ebeef5"/>
+  <line x1="700" y1="164" x2="700" y2="468" stroke="#ebeef5"/>
+  <line x1="940" y1="164" x2="940" y2="468" stroke="#ebeef5"/>
+  <line x1="1020" y1="164" x2="1020" y2="468" stroke="#ebeef5"/>
+  <text x="42" y="193" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">选择</text>
+  <text x="104" y="193" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">用例编号</text>
+  <text x="224" y="193" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">模块</text>
+  <text x="384" y="193" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">标题</text>
+  <text x="718" y="193" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">执行结果</text>
+  <text x="958" y="193" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" font-weight="700" fill="#606266">操作</text>
+  <rect x="43" y="232" width="16" height="16" fill="#409eff" rx="3"/>
+  <text x="108" y="254" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">1</text>
+  <text x="224" y="254" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">登录</text>
+  <text x="384" y="254" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">手机号登录成功</text>
+  <text x="718" y="254" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#67c23a">通过</text>
+  <rect x="950" y="228" width="54" height="28" rx="4" fill="#909399"/>
+  <text x="963" y="247" font-size="12" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">编辑</text>
+  <rect x="1028" y="228" width="54" height="28" rx="4" fill="#f56c6c"/>
+  <text x="1041" y="247" font-size="12" font-family="Microsoft YaHei,Arial,sans-serif" fill="#ffffff">删除</text>
+  <text x="108" y="319" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">2</text>
+  <text x="224" y="319" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">会员</text>
+  <text x="384" y="319" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#303133">权益列表展示</text>
+  <text x="718" y="319" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">未执行</text>
+  <text x="958" y="319" font-size="13" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">操作列固定在右侧</text>
+  <text x="48" y="510" font-size="14" font-family="Microsoft YaHei,Arial,sans-serif" fill="#909399">编辑模式示例 · 用例、项目和版本名称均为虚构数据</text>
+</svg>
