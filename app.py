@@ -481,10 +481,50 @@ def delete_merge(merge_id):
     return jsonify({'success': True})
 
 
+def _case_display_sort_key(case):
+    """兼容历史 sort_order 为空的数据，并保持列表当前可见顺序。"""
+    if case.sort_order is None:
+        return (1, case.id or 0, case.id or 0)
+    return (0, case.sort_order, case.id or 0)
+
+
+def normalize_case_order(project_id, version_id, reset_numbers=False):
+    """按当前列表顺序补齐行排序；插入后可同时重排用例编号。"""
+    cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+    cases.sort(key=_case_display_sort_key)
+    for index, case in enumerate(cases, start=1):
+        case.sort_order = index * 1000
+        if reset_numbers:
+            case.case_no = str(index)
+    return cases
+
+
+def normalize_case_merges(project_id, version_id, cases=None):
+    """修复插入行落在纵向合并区域中却未写入合并关系的历史数据。"""
+    if cases is None:
+        cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+        cases.sort(key=_case_display_sort_key)
+    positions = {case.id: index for index, case in enumerate(cases)}
+    changed = False
+    merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version_id).all()
+    for merge in merges:
+        member_ids = [case_id for case_id in merge.get_case_ids() if case_id in positions]
+        if len(member_ids) < 2:
+            continue
+        start = min(positions[case_id] for case_id in member_ids)
+        end = max(positions[case_id] for case_id in member_ids)
+        expected_ids = [case.id for case in cases[start:end + 1]]
+        if expected_ids != member_ids:
+            merge.set_case_ids(expected_ids)
+            changed = True
+    return changed
+
+
 def compute_sort_orders(project_id, version_id, target_id=None, position=None, count=1):
-    """根据插入目标计算新行的 sort_order 列表（递增）"""
-    cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id)\
-        .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
+    """根据插入目标计算新行的 sort_order 列表（递增）。"""
+    # 老数据可能没有 sort_order。先按原有列表顺序补齐，避免 None 参与算术运算，
+    # 也让连续插入不会因为间隔耗尽而产生大量相同排序值。
+    cases = normalize_case_order(project_id, version_id)
     n = max(1, count)
     if not cases:
         return [1000 * (i + 1) for i in range(n)]
@@ -530,18 +570,37 @@ def get_cases(project_id, version_id):
     page_size = request.args.get('page_size', 20, type=int)
     if page_size not in [20, 50, 100]:
         page_size = 20
-    keyword = request.args.get('keyword', '')
+    keyword = (request.args.get('keyword', '') or '').strip()
 
     init_system_columns(project_id)
+    all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+    if any(case.sort_order in (None, 0) for case in all_cases):
+        all_cases = normalize_case_order(project_id, version_id)
+    else:
+        all_cases.sort(key=_case_display_sort_key)
+    if normalize_case_merges(project_id, version_id, all_cases):
+        db.session.commit()
     query = TestCase.query.filter_by(project_id=project_id, version_id=version_id)
     if keyword:
-        query = query.filter(
-            db.or_(
-                TestCase.title.contains(keyword),
-                TestCase.case_no.contains(keyword),
-                TestCase.module.contains(keyword)
-            )
+        # 支持多个关键词，要求每个关键词都能在当前用例的任意字段中找到；
+        # 同时覆盖系统字段和自定义字段，避免搜索结果过窄。
+        searchable_fields = (
+            TestCase.case_no,
+            TestCase.module,
+            TestCase.title,
+            TestCase.precondition,
+            TestCase.steps,
+            TestCase.expected_result,
+            TestCase.priority,
+            TestCase.status,
+            TestCase.remark,
+            TestCase.custom_fields,
         )
+        keywords = [part for part in re.split(r'\s+', keyword) if part]
+        for part in keywords:
+            query = query.filter(db.or_(*[
+                field.contains(part, autoescape=True) for field in searchable_fields
+            ]))
 
     total = query.count()
     cases = query.order_by(TestCase.sort_order.asc(), TestCase.id.asc()).offset((page - 1) * page_size).limit(page_size).all()
@@ -732,10 +791,7 @@ def reset_case_numbers(project_id, version_id):
     if not version:
         return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
 
-    cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id) \
-        .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
-    for index, case in enumerate(cases, start=1):
-        case.case_no = str(index)
+    cases = normalize_case_order(project_id, version_id, reset_numbers=True)
     db.session.commit()
     return jsonify({'success': True, 'data': {'reset': len(cases)}})
 
@@ -806,6 +862,10 @@ def create_cases_batch():
         return jsonify({'success': False, 'message': '没有用例数据'}), 400
 
     target_id = data.get('insert_target')
+    try:
+        target_id = int(target_id) if target_id is not None else None
+    except (TypeError, ValueError):
+        target_id = None
     position = data.get('insert_position')  # 'above' 或 'below'
     valid_keys = {c.key for c in CustomColumn.query.filter_by(project_id=project_id, is_system=False).all()}
     sort_orders = compute_sort_orders(project_id, version_id, target_id, position, len(cases_data))
@@ -842,6 +902,22 @@ def create_cases_batch():
         created.append(case)
 
     db.session.flush()
+    # 插入完成后立即按列表顺序重排排序值和编号，避免出现 1、2、98、43
+    # 或历史空 sort_order 导致的新行位置错乱。
+    ordered_cases = normalize_case_order(project_id, version_id, reset_numbers=True)
+    inserted_ids = {case.id for case in created}
+    if target_id and inserted_ids:
+        # 目标位于纵向合并区域时，新行也必须加入该合并关系；否则 rowspan
+        # 会跨过新行，导致后续行少一个 td、整行向左错位。
+        for merge in CaseMerge.query.filter_by(
+                project_id=project_id, version_id=version_id).all():
+            existing_ids = set(merge.get_case_ids())
+            if target_id not in existing_ids:
+                continue
+            merge.set_case_ids([
+                case.id for case in ordered_cases
+                if case.id in existing_ids or case.id in inserted_ids
+            ])
     db.session.commit()
     columns = CustomColumn.query.filter_by(project_id=project_id).order_by(CustomColumn.sort_order).all()
     columns_dict = [c.to_dict() for c in columns]
@@ -1518,7 +1594,7 @@ def migrate_sort_order():
                 conn.execute(text("ALTER TABLE test_cases ADD COLUMN sort_order INT DEFAULT 0"))
             except Exception:
                 pass  # 字段已存在
-            conn.execute(text("UPDATE test_cases SET sort_order = id * 1000 WHERE sort_order = 0"))
+            conn.execute(text("UPDATE test_cases SET sort_order = id * 1000 WHERE sort_order IS NULL OR sort_order = 0"))
             version_sort_added = False
             try:
                 conn.execute(text("ALTER TABLE versions ADD COLUMN sort_order INT DEFAULT 0"))

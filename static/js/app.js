@@ -409,8 +409,8 @@ function removeContextMenu(){
 
 function findMerge(c,caseId){return state.merges.find(merge=>merge.column_key===c.key&&(merge.case_ids||[]).includes(caseId));}
 
-function renderCell(c,tc,pageIds=[]){
-  const merge=findMerge(c,tc.id);
+function renderCell(c,tc,pageIds=[],ignoreMerge=false){
+  const merge=ignoreMerge?null:findMerge(c,tc.id);
   if(merge){
     const visibleIds=(merge.case_ids||[]).filter(id=>pageIds.includes(id));
     if(visibleIds.length>1&&visibleIds[0]!==tc.id)return '';
@@ -862,23 +862,35 @@ function renderQuickAddRows(){
   const cols=visibleColumns();
   const thead=$('#case-table thead');
   const tbody=$('#case-table tbody');
+  const showSelection=state.editMode;
   const ths=cols.map(c=>`<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${c.width}px"><span class="col-title">${escapeHtml(c.name)}</span></th>`).join('');
-  thead.innerHTML=`<tr>${ths}<th class="actions-header" style="width:132px">操作</th></tr>`;
+  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"></th>':''}${ths}<th class="actions-header" style="width:132px">操作</th></tr>`;
   tbody.innerHTML='';
   const count=state.quickInsertCount||1;
   const target=state.quickInsertTarget||{type:'top'};
   const targetId=target.caseId;
   const pos=target.type;
+  const pageIds=state.cases.map(tc=>tc.id);
 
-  function appendInputRow(i){const tr=document.createElement('tr');tr.className='quick-add-row';tr.innerHTML=buildQuickInputRow(i,cols);tbody.appendChild(tr);}
+  function appendInputRow(i){const tr=document.createElement('tr');tr.className='quick-add-row';tr.innerHTML=`${showSelection?'<td class="select-cell"></td>':''}${buildQuickInputRow(i,cols)}`;tbody.appendChild(tr);}
+  function appendExistingRow(tc){
+    const tr=document.createElement('tr');
+    tr.dataset.caseId=tc.id;
+    tr.addEventListener('contextmenu',showRowContextMenu);
+    // 输入行暂时位于已有合并区域中，不能让旧 rowspan 跨过输入行；保存后
+    // 后端会把目标合并关系扩展到新用例，再由普通表格渲染最终合并效果。
+    const selection=showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:'';
+    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds,true)).join('')}<td class="actions-cell">${renderRowActions(tc.id)}</td>`;
+    tbody.appendChild(tr);
+  }
 
   if(pos==='top'){
     for(let i=0;i<count;i++)appendInputRow(i);
-    state.cases.forEach(tc=>{const tr=document.createElement('tr');tr.dataset.caseId=tc.id;tr.addEventListener('contextmenu',showRowContextMenu);tr.innerHTML=cols.map(c=>renderCell(c,tc)).join('')+`<td class="actions-cell">${renderRowActions(tc.id)}</td>`;tbody.appendChild(tr);});
+    state.cases.forEach(appendExistingRow);
   }else if(pos==='above'||pos==='below'){
     state.cases.forEach(tc=>{
       if(pos==='above'&&tc.id===targetId){for(let i=0;i<count;i++)appendInputRow(i);}
-      const tr=document.createElement('tr');tr.dataset.caseId=tc.id;tr.addEventListener('contextmenu',showRowContextMenu);tr.innerHTML=cols.map(c=>renderCell(c,tc)).join('')+`<td class="actions-cell">${renderRowActions(tc.id)}</td>`;tbody.appendChild(tr);
+      appendExistingRow(tc);
       if(pos==='below'&&tc.id===targetId){for(let i=0;i<count;i++)appendInputRow(i);}
     });
   }else{
@@ -894,7 +906,8 @@ async function saveQuickRows(){
   const payloads=[];
   for(let i=0;i<count;i++){
     const payload={project_id:state.currentProject.id,version_id:state.currentVersion.id,custom_fields:{}};
-    cols.forEach(c=>{const el=$(`#qa-${c.key}-${i}`);if(!el)return;if(c.is_system)payload[c.key]=el.value;else payload.custom_fields[c.key]=el.value;});
+    cols.forEach(c=>{const el=document.getElementById(`qa-${c.key}-${i}`);if(!el)return;if(c.is_system)payload[c.key]=el.value;else payload.custom_fields[c.key]=el.value;});
+    if(!STATUS_LIST.includes(payload.status))payload.status='未执行';
     payloads.push(payload);
   }
   try{
