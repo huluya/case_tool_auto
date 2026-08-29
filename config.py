@@ -18,11 +18,8 @@ BACKUP_DIR = os.getenv('BACKUP_DIR', os.path.join(BASE_DIR, 'backups'))
 # 项目删除密码
 DELETE_PASSWORD = os.getenv('DELETE_PASSWORD', '000000')
 
-# 账号体系（username -> password）
-USERS = {
-    'admin': os.getenv('ADMIN_PASSWORD', '123456'),
-    'test': os.getenv('TEST_PASSWORD', '123456'),
-}
+# Flask 会话签名；账号、密码和角色均存储在 MySQL，不再由配置文件维护。
+SECRET_KEY = os.getenv('SECRET_KEY', 'case-manager-local-secret-change-me')
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
 

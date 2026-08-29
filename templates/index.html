@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>用例管理平台</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=20260827-16">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260829-21">
 </head>
 <body>
   <!-- 登录页 -->
@@ -25,17 +25,14 @@
     <div class="topbar">
       <div class="topbar-left">
         <h1>用例管理平台</h1>
-        <div id="current-project-name" style="font-weight:600">未选择项目</div>
+        <div id="current-project-name" class="current-project-label">未选择项目</div>
         <div class="stats-bar" id="stats-bar">
           <span>共 0 条</span>
         </div>
         <button id="btn-summary" class="summary-btn" disabled>总结结果</button>
       </div>
       <div class="topbar-right">
-        <div class="search-box">
-          <input type="text" id="search-input" placeholder="搜索用例标题/序号/模块">
-          <button id="btn-search">搜索</button>
-        </div>
+        <span id="current-user-role" class="account-role-hint" aria-live="polite"></span>
         <button id="btn-columns">列设置</button>
         <button id="btn-import">用例导入</button>
         <button id="btn-export-excel">下载当前版本 Excel</button>
@@ -62,6 +59,22 @@
             <button id="btn-add-version">新建版本</button>
           </div>
           <div class="toolbar-right">
+            <div class="toolbar-search-box">
+              <div class="search-box">
+                <input type="text" id="search-input" placeholder="搜索用例标题/序号/模块">
+                <button id="btn-search">搜索</button>
+              </div>
+              <div class="status-filter" id="status-filter">
+                <button type="button" class="filter-trigger" id="status-filter-trigger">执行结果：全部</button>
+                <div class="status-filter-options">
+                  <label><input type="checkbox" name="status-filter-option" value="通过">通过</label>
+                  <label><input type="checkbox" name="status-filter-option" value="失败">失败</label>
+                  <label><input type="checkbox" name="status-filter-option" value="未执行">未执行</label>
+                  <label><input type="checkbox" name="status-filter-option" value="阻塞">阻塞</label>
+                  <label><input type="checkbox" name="status-filter-option" value="跳过">跳过</label>
+                </div>
+              </div>
+            </div>
             <label class="switch-wrap">
               <input type="checkbox" id="edit-mode-toggle">
               <span class="switch-slider"></span>
@@ -87,6 +100,9 @@
     </div>
   </div>
 
+  <!-- 选中文字后显示的编辑工具条；没有选中文本时保持隐藏 -->
+  <div id="selection-format-menu" class="selection-format-menu" role="toolbar" aria-label="文本对齐工具"></div>
+
   <!-- 用例弹窗 -->
   <div class="modal-overlay" id="case-modal">
     <div class="modal">
@@ -110,7 +126,6 @@
         <button class="close-btn" onclick="closeCellEditor()">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="rich-format-toolbar"><button type="button" class="secondary" onmousedown="event.preventDefault()" onclick="toggleStrike()">删除线</button><span>选中文字后点击“删除线”，或按 Ctrl+Shift+X</span></div>
         <div id="cell-editor-input" class="large-cell-editor rich-editor" contenteditable="true" role="textbox" aria-label="编辑内容" data-placeholder="请输入内容"></div>
         <div class="cell-editor-attachments">
           <button type="button" class="secondary paste-image-btn" onclick="pasteImageFromClipboard()">从剪贴板粘贴图片</button>
@@ -243,6 +258,6 @@
     });
     document.getElementById('lightbox-img').addEventListener('pointerup', () => {lightboxDrag=null;});
   </script>
-  <script src="/static/js/app.js?v=20260827-16"></script>
+  <script src="/static/js/app.js?v=20260829-14"></script>
 </body>
 </html>

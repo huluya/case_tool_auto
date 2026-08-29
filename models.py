@@ -6,6 +6,45 @@ from sqlalchemy.dialects.mysql import LONGBLOB
 db = SQLAlchemy()
 
 
+class Role(db.Model):
+    __tablename__ = 'roles'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(50), nullable=False)
+    status = db.Column(db.Integer, nullable=False, unique=True)  # 0只读，1测试，2管理员
+    description = db.Column(db.String(255), nullable=False, default='')
+    # 权限由角色表维护，应用只读取这些字段，不根据角色名称或状态码硬编码判断。
+    can_write = db.Column(db.Boolean, nullable=True, default=None)
+    can_manage = db.Column(db.Boolean, nullable=True, default=None)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    users = db.relationship('User', backref='role', lazy=True)
+
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    username = db.Column(db.String(100), nullable=False, unique=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role_id = db.Column(db.Integer, db.ForeignKey('roles.id'), nullable=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self):
+        role = self.role
+        return {
+            'id': self.id,
+            'username': self.username,
+            'status': role.status if role else None,
+            'role_status': role.status if role else None,
+            'role_name': role.name if role else '',
+            'can_write': bool(role.can_write) if role and role.can_write is not None else False,
+            'can_manage': bool(role.can_manage) if role and role.can_manage is not None else False,
+            'is_active': self.is_active,
+        }
+
+
 class Project(db.Model):
     __tablename__ = 'projects'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -39,6 +78,7 @@ class Version(db.Model):
 
     cases = db.relationship('TestCase', backref='version', lazy=True, cascade='all, delete-orphan')
     merges = db.relationship('CaseMerge', backref='version', lazy=True, cascade='all, delete-orphan')
+    columns = db.relationship('CustomColumn', backref='version', lazy=True, cascade='all, delete-orphan')
 
     def to_dict(self):
         return {
@@ -54,24 +94,29 @@ class CustomColumn(db.Model):
     __tablename__ = 'custom_columns'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
+    # 列配置属于具体版本，不能在同一项目的不同版本之间互相覆盖。
+    version_id = db.Column(db.Integer, db.ForeignKey('versions.id'), nullable=True)
     name = db.Column(db.String(100), nullable=False)       # 显示名称
     key = db.Column(db.String(100), nullable=False)         # 字段标识
     is_system = db.Column(db.Boolean, default=False)        # 是否系统预设列
     is_visible = db.Column(db.Boolean, default=True)        # 是否显示
     width = db.Column(db.Integer, default=120)              # 列宽 px
     sort_order = db.Column(db.Integer, default=0)           # 排序
+    text_align = db.Column(db.String(10), nullable=False, default='left')  # left/center/right
     created_at = db.Column(db.DateTime, default=datetime.now)
 
     def to_dict(self):
         return {
             'id': self.id,
             'project_id': self.project_id,
+            'version_id': self.version_id,
             'name': self.name,
             'key': self.key,
             'is_system': self.is_system,
             'is_visible': self.is_visible,
             'width': self.width,
             'sort_order': self.sort_order,
+            'text_align': self.text_align or 'left',
         }
 
 

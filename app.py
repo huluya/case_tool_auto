@@ -6,13 +6,14 @@ import shutil
 import subprocess
 import re
 import posixpath
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 from datetime import datetime
 
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, render_template, session
 from sqlalchemy import create_engine, text
 from werkzeug.utils import secure_filename
+from werkzeug.security import check_password_hash, generate_password_hash
 import openpyxl
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
@@ -24,14 +25,124 @@ from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.worksheet.cell_range import CellRange
 
 import config
-from models import db, Project, Version, CustomColumn, TestCase, CaseImage, CaseMerge, SYSTEM_COLUMNS, STATUS_LIST
+from models import (
+    db, Project, Version, CustomColumn, TestCase, CaseImage, CaseMerge,
+    Role, User, SYSTEM_COLUMNS, STATUS_LIST
+)
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = config.SQLALCHEMY_DATABASE_URI
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+app.secret_key = config.SECRET_KEY
 
 db.init_app(app)
+
+
+ROLE_READONLY = 0
+ROLE_TEST = 1
+ROLE_ADMIN = 2
+ADMIN_ENDPOINTS = {
+    'update_project', 'delete_project',
+    'update_version', 'delete_version', 'copy_version',
+    'backup_database',
+}
+
+
+def migrate_auth_schema():
+    """为已有 roles 表补充数据库维护的权限字段。"""
+    with db.engine.begin() as conn:
+        for column, definition in (
+            ('can_write', 'TINYINT(1) NULL DEFAULT NULL'),
+            ('can_manage', 'TINYINT(1) NULL DEFAULT NULL'),
+        ):
+            try:
+                conn.execute(text(f'ALTER TABLE roles ADD COLUMN {column} {definition}'))
+            except Exception:
+                pass  # 字段已存在
+
+
+def initialize_auth_data():
+    """创建权限表并补齐首次运行所需的角色和账号。"""
+    try:
+        db.create_all()
+    except Exception:
+        # 支持直接使用 flask run 的场景：数据库尚未创建时先创建库，
+        # 再创建 roles/users 等应用表。
+        create_database()
+        db.create_all()
+    migrate_auth_schema()
+    role_seeds = (
+        (ROLE_READONLY, '只读', '只能查看和导出数据', False, False),
+        (ROLE_TEST, '测试', '可以编辑用例和执行结果', True, False),
+        (ROLE_ADMIN, '管理员', '可以管理项目、版本、用例和备份', True, True),
+    )
+    roles = {}
+    for status, name, description, can_write, can_manage in role_seeds:
+        role = Role.query.filter_by(status=status).first()
+        if not role:
+            role = Role(
+                status=status, name=name, description=description,
+                can_write=can_write, can_manage=can_manage, is_active=True
+            )
+            db.session.add(role)
+            db.session.flush()
+        else:
+            # 旧版本角色表没有权限字段时，迁移出的 NULL 才使用默认值；
+            # 后续管理员在数据库中的修改不会被启动流程覆盖。
+            if role.can_write is None:
+                role.can_write = can_write
+            if role.can_manage is None:
+                role.can_manage = can_manage
+        roles[status] = role
+
+    user_seeds = (
+        ('admin', '123456', ROLE_ADMIN),
+        ('test', '123456', ROLE_TEST),
+        ('readonly', '123456', ROLE_READONLY),
+    )
+    for username, password, role_status in user_seeds:
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            db.session.add(User(
+                username=username,
+                password_hash=generate_password_hash(password),
+                role_id=roles[role_status].id,
+                is_active=True,
+            ))
+        elif not user.role_id:
+            user.role_id = roles[role_status].id
+    db.session.commit()
+
+
+def current_user():
+    """返回当前会话账号；角色是否启用由数据库决定。"""
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    return User.query.join(Role).filter(
+        User.id == user_id,
+        User.is_active.is_(True),
+        Role.is_active.is_(True),
+    ).first()
+
+
+@app.before_request
+def require_api_login():
+    if not request.path.startswith('/api'):
+        return None
+    if request.method == 'OPTIONS':
+        return None
+    if request.path == '/api/auth/login' or request.endpoint == 'logout':
+        return None
+    user = current_user()
+    if not user:
+        return jsonify({'success': False, 'message': '请先登录'}), 401
+    if not user.role.can_write and request.method != 'GET':
+        return jsonify({'success': False, 'message': '只读账号不可操作'}), 403
+    if request.endpoint in ADMIN_ENDPOINTS and not user.role.can_manage:
+        return jsonify({'success': False, 'message': '当前账号没有管理员权限'}), 403
+    return None
 
 
 def create_database():
@@ -44,16 +155,32 @@ def create_database():
         conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {config.DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"))
 
 
-def init_system_columns(project_id):
-    """初始化系统列，并将历史导入的同名自定义列迁移为系统列。"""
+def init_system_columns(project_id, version_id):
+    """初始化指定版本的系统列，列配置严格按版本隔离。"""
+    if not version_id:
+        return
+    columns = CustomColumn.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    if not columns:
+        # 兼容尚未完成旧数据迁移的数据库：把历史项目级列归到当前版本。
+        legacy = CustomColumn.query.filter_by(
+            project_id=project_id, version_id=None
+        ).all()
+        if legacy:
+            for column in legacy:
+                column.version_id = version_id
+            columns = legacy
+
+    by_key = {column.key: column for column in columns}
     for idx, col in enumerate(SYSTEM_COLUMNS):
-        exists = CustomColumn.query.filter_by(project_id=project_id, key=col['key']).first()
+        exists = by_key.get(col['key'])
         if not exists:
-            legacy = CustomColumn.query.filter_by(
-                project_id=project_id, name=col['name'], is_system=False
-            ).first()
+            legacy = next((column for column in columns
+                           if column.name == col['name'] and not column.is_system), None)
             if legacy:
-                for case in TestCase.query.filter_by(project_id=project_id).all():
+                for case in TestCase.query.filter_by(
+                        project_id=project_id, version_id=version_id).all():
                     custom = case.get_custom_fields()
                     if legacy.key in custom:
                         setattr(case, col['key'], custom.pop(legacy.key))
@@ -63,9 +190,11 @@ def init_system_columns(project_id):
                 legacy.is_system = True
                 legacy.width = col['width']
                 legacy.sort_order = idx
+                by_key[col['key']] = legacy
             else:
-                c = CustomColumn(
+                created = CustomColumn(
                     project_id=project_id,
+                    version_id=version_id,
                     name=col['name'],
                     key=col['key'],
                     is_system=col['is_system'],
@@ -73,8 +202,15 @@ def init_system_columns(project_id):
                     width=col['width'],
                     sort_order=idx
                 )
-                db.session.add(c)
+                db.session.add(created)
     db.session.commit()
+
+
+def query_version_columns(project_id, version_id):
+    """返回某个版本的全部列，禁止跨版本读取列配置。"""
+    return CustomColumn.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).order_by(CustomColumn.sort_order.asc(), CustomColumn.id.asc()).all()
 
 
 @app.route('/')
@@ -83,19 +219,34 @@ def index():
 
 
 @app.route('/login', methods=['POST'])
+@app.route('/api/auth/login', methods=['POST'])
 def login():
+    initialize_auth_data()
     data = request.json or {}
     username = (data.get('username') or '').strip()
     password = data.get('password', '')
-    if username in config.USERS and config.USERS[username] == password:
+    user = User.query.filter_by(username=username, is_active=True).first()
+    if user and user.role and user.role.is_active and check_password_hash(user.password_hash, password):
+        session.clear()
+        session['user_id'] = user.id
+        role_data = user.to_dict()
         return jsonify({
             'success': True,
-            'data': {
-                'username': username,
-                'role': 'admin' if username == 'admin' else 'test'
-            }
+            'data': role_data
         })
     return jsonify({'success': False, 'message': '账号或密码错误'}), 401
+
+
+@app.route('/api/auth/me', methods=['GET'])
+def auth_me():
+    user = current_user()
+    return jsonify({'success': True, 'data': user.to_dict()})
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True})
 
 
 # ------------------- 项目 -------------------
@@ -118,7 +269,6 @@ def create_project():
     db.session.add(project)
     db.session.flush()
 
-    init_system_columns(project.id)
     db.session.commit()
 
     return jsonify({'success': True, 'data': project.to_dict()})
@@ -168,6 +318,8 @@ def create_version(project_id):
     max_order = db.session.query(db.func.max(Version.sort_order)).filter_by(project_id=project_id).scalar()
     version = Version(project_id=project_id, version_name=name, sort_order=(max_order if max_order is not None else -1) + 1)
     db.session.add(version)
+    db.session.flush()
+    init_system_columns(project_id, version.id)
     db.session.commit()
     return jsonify({'success': True, 'data': version.to_dict()})
 
@@ -175,6 +327,7 @@ def create_version(project_id):
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/copy', methods=['POST'])
 def copy_version(project_id, version_id):
     source = Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
+    init_system_columns(project_id, source.id)
     data = request.json or {}
     name = (data.get('version_name') or '').strip()
     if not name:
@@ -191,6 +344,18 @@ def copy_version(project_id, version_id):
     try:
         db.session.add(new_version)
         db.session.flush()
+        for source_column in query_version_columns(project_id, source.id):
+            db.session.add(CustomColumn(
+                project_id=project_id,
+                version_id=new_version.id,
+                name=source_column.name,
+                key=source_column.key,
+                is_system=source_column.is_system,
+                is_visible=source_column.is_visible,
+                width=source_column.width,
+                sort_order=source_column.sort_order,
+                text_align=source_column.text_align or 'left',
+            ))
         source_cases = TestCase.query.filter_by(project_id=project_id, version_id=source.id) \
             .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
         case_id_map = {}
@@ -329,15 +494,17 @@ def delete_version(project_id, version_id):
 
 
 # ------------------- 自定义列 -------------------
-@app.route('/api/projects/<int:project_id>/columns', methods=['GET'])
-def get_columns(project_id):
-    init_system_columns(project_id)
-    columns = CustomColumn.query.filter_by(project_id=project_id).order_by(CustomColumn.sort_order).all()
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/columns', methods=['GET'])
+def get_columns(project_id, version_id):
+    Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
+    init_system_columns(project_id, version_id)
+    columns = query_version_columns(project_id, version_id)
     return jsonify({'success': True, 'data': [c.to_dict() for c in columns]})
 
 
-@app.route('/api/projects/<int:project_id>/columns', methods=['POST'])
-def add_column(project_id):
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/columns', methods=['POST'])
+def add_column(project_id, version_id):
+    Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
     data = request.json or {}
     name = (data.get('name') or '').strip()
     key = (data.get('key') or '').strip()
@@ -345,12 +512,15 @@ def add_column(project_id):
         return jsonify({'success': False, 'message': '列名和字段标识不能为空'}), 400
     if not key.isidentifier():
         return jsonify({'success': False, 'message': '字段标识需为合法标识符'}), 400
-    if CustomColumn.query.filter_by(project_id=project_id, key=key).first():
+    if CustomColumn.query.filter_by(project_id=project_id, version_id=version_id, key=key).first():
         return jsonify({'success': False, 'message': '字段标识已存在'}), 400
 
-    max_order = db.session.query(db.func.max(CustomColumn.sort_order)).filter_by(project_id=project_id).scalar() or 0
+    max_order = db.session.query(db.func.max(CustomColumn.sort_order)).filter_by(
+        project_id=project_id, version_id=version_id
+    ).scalar() or 0
     col = CustomColumn(
         project_id=project_id,
+        version_id=version_id,
         name=name,
         key=key,
         is_system=False,
@@ -375,21 +545,25 @@ def update_column(column_id):
         if not system_def:
             return jsonify({'success': False, 'message': '目标系统列不存在'}), 400
         target = CustomColumn.query.filter_by(
-            project_id=col.project_id, key=convert_to_system, is_system=True
+            project_id=col.project_id, version_id=col.version_id,
+            key=convert_to_system, is_system=True
         ).first()
         if not target:
             target = CustomColumn(
                 project_id=col.project_id,
+                version_id=col.version_id,
                 name=system_def['name'],
                 key=system_def['key'],
                 is_system=True,
                 is_visible=col.is_visible,
                 width=system_def['width'],
                 sort_order=col.sort_order,
+                text_align=col.text_align or 'left',
             )
             db.session.add(target)
             db.session.flush()
-        for case in TestCase.query.filter_by(project_id=col.project_id).all():
+        for case in TestCase.query.filter_by(
+                project_id=col.project_id, version_id=col.version_id).all():
             custom = case.get_custom_fields()
             if col.key in custom:
                 setattr(case, convert_to_system, custom[col.key])
@@ -399,13 +573,29 @@ def update_column(column_id):
         db.session.commit()
         return jsonify({'success': True, 'data': target.to_dict()})
     if 'name' in data:
-        col.name = data['name'].strip()
+        name = str(data.get('name') or '').strip()
+        if not name:
+            return jsonify({'success': False, 'message': '列名称不能为空'}), 400
+        duplicate = CustomColumn.query.filter(
+            CustomColumn.project_id == col.project_id,
+            CustomColumn.version_id == col.version_id,
+            CustomColumn.name == name,
+            CustomColumn.id != col.id,
+        ).first()
+        if duplicate:
+            return jsonify({'success': False, 'message': '当前版本已存在同名列'}), 400
+        col.name = name
     if 'is_visible' in data:
         col.is_visible = bool(data['is_visible'])
     if 'width' in data:
         col.width = int(data['width'])
     if 'sort_order' in data:
         col.sort_order = int(data['sort_order'])
+    if 'text_align' in data:
+        text_align = (data.get('text_align') or '').strip().lower()
+        if text_align not in {'left', 'center', 'right'}:
+            return jsonify({'success': False, 'message': '对齐方式无效'}), 400
+        col.text_align = text_align
     db.session.commit()
     return jsonify({'success': True, 'data': col.to_dict()})
 
@@ -420,12 +610,15 @@ def delete_column(column_id):
     return jsonify({'success': True})
 
 
-@app.route('/api/projects/<int:project_id>/columns/order', methods=['POST'])
-def update_columns_order(project_id):
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/columns/order', methods=['POST'])
+def update_columns_order(project_id, version_id):
+    Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
     data = request.json or {}
     orders = data.get('orders', {})
     for col_id, order in orders.items():
-        col = CustomColumn.query.filter_by(id=col_id, project_id=project_id).first()
+        col = CustomColumn.query.filter_by(
+            id=col_id, project_id=project_id, version_id=version_id
+        ).first()
         if col:
             col.sort_order = int(order)
     db.session.commit()
@@ -438,8 +631,12 @@ def create_merge(project_id, version_id):
     data = request.json or {}
     column_key = (data.get('column_key') or '').strip()
     case_ids = data.get('case_ids') or []
+    if column_key == 'case_no':
+        return jsonify({'success': False, 'message': '用例编号按实际用例行自动编号，不参与合并'}), 400
     version = Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
-    column = CustomColumn.query.filter_by(project_id=project_id, key=column_key).first()
+    column = CustomColumn.query.filter_by(
+        project_id=project_id, version_id=version_id, key=column_key
+    ).first()
     if not column:
         return jsonify({'success': False, 'message': '列不存在'}), 400
     try:
@@ -469,6 +666,8 @@ def create_merge(project_id, version_id):
     merge = CaseMerge(project_id=project_id, version_id=version_id, column_key=column_key)
     merge.set_case_ids([case.id for case in cases])
     db.session.add(merge)
+    db.session.flush()
+    normalize_case_order(project_id, version_id, reset_numbers=True)
     db.session.commit()
     return jsonify({'success': True, 'data': merge.to_dict()})
 
@@ -476,7 +675,10 @@ def create_merge(project_id, version_id):
 @app.route('/api/merges/<int:merge_id>', methods=['DELETE'])
 def delete_merge(merge_id):
     merge = CaseMerge.query.get_or_404(merge_id)
+    project_id, version_id = merge.project_id, merge.version_id
     db.session.delete(merge)
+    db.session.flush()
+    normalize_case_order(project_id, version_id, reset_numbers=True)
     db.session.commit()
     return jsonify({'success': True})
 
@@ -488,15 +690,79 @@ def _case_display_sort_key(case):
     return (0, case.sort_order, case.id or 0)
 
 
+def logical_case_groups(project_id, version_id, cases=None):
+    """按标题合并范围返回逻辑用例分组。
+
+    Excel 中把一条用例的步骤拆成多行后，页面会通过合并“标题”把这些
+    物理行标识为同一条逻辑用例。没有标题合并的版本仍按单行计算，避免
+    影响正常格式导入的数据。
+    """
+    if cases is None:
+        cases = TestCase.query.filter_by(
+            project_id=project_id, version_id=version_id
+        ).all()
+    ordered_cases = sorted(cases, key=_case_display_sort_key)
+    case_by_id = {case.id: case for case in ordered_cases}
+    positions = {case.id: index for index, case in enumerate(ordered_cases)}
+    merge_members = {}
+    title_merges = CaseMerge.query.filter_by(
+        project_id=project_id, version_id=version_id, column_key='title'
+    ).all()
+    for merge in title_merges:
+        member_ids = [case_id for case_id in merge.get_case_ids()
+                      if case_id in positions]
+        if len(member_ids) < 2:
+            continue
+        member_ids.sort(key=positions.get)
+        # 一个用例只能属于一个标题分组；异常重叠数据按先出现的合并保留。
+        if any(case_id in merge_members for case_id in member_ids):
+            continue
+        for case_id in member_ids:
+            merge_members[case_id] = member_ids
+
+    groups = []
+    seen = set()
+    for case in ordered_cases:
+        if case.id in seen:
+            continue
+        member_ids = merge_members.get(case.id, [case.id])
+        group = [case_by_id[case_id] for case_id in member_ids
+                 if case_id in case_by_id and case_id not in seen]
+        if not group:
+            continue
+        groups.append(group)
+        seen.update(item.id for item in group)
+    return groups
+
+
 def normalize_case_order(project_id, version_id, reset_numbers=False):
     """按当前列表顺序补齐行排序；插入后可同时重排用例编号。"""
     cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
     cases.sort(key=_case_display_sort_key)
     for index, case in enumerate(cases, start=1):
         case.sort_order = index * 1000
-        if reset_numbers:
-            case.case_no = str(index)
+    if reset_numbers:
+        for index, group in enumerate(logical_case_groups(project_id, version_id, cases), start=1):
+            for case in group:
+                case.case_no = str(index)
     return cases
+
+
+def ensure_case_numbers(project_id, version_id, cases=None):
+    """按逻辑用例顺序校正编号；标题合并组只计为一条。"""
+    if cases is None:
+        cases = normalize_case_order(project_id, version_id)
+    else:
+        cases = sorted(cases, key=_case_display_sort_key)
+    groups = logical_case_groups(project_id, version_id, cases)
+    expected = [str(index) for index in range(1, len(groups) + 1)]
+    current = [str(group[0].case_no or '') for group in groups]
+    if current == expected:
+        return False
+    for group, case_no in zip(groups, expected):
+        for case in group:
+            case.case_no = case_no
+    return True
 
 
 def normalize_case_merges(project_id, version_id, cases=None):
@@ -508,6 +774,12 @@ def normalize_case_merges(project_id, version_id, cases=None):
     changed = False
     merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version_id).all()
     for merge in merges:
+        # 用例编号必须逐行显示并按真实用例数量连续编号。历史导入的
+        # 编号合并只影响显示，不影响用例数据，直接清理其合并记录。
+        if merge.column_key == 'case_no':
+            db.session.delete(merge)
+            changed = True
+            continue
         member_ids = [case_id for case_id in merge.get_case_ids() if case_id in positions]
         if len(member_ids) < 2:
             continue
@@ -563,6 +835,45 @@ def compute_sort_orders(project_id, version_id, target_id=None, position=None, c
     return [start + step * (i + 1) for i in range(n)]
 
 
+def normalize_merge_insert_target(project_id, version_id, target_id=None,
+                                  position=None):
+    """把合并区域内的插入点调整到整个合并块的边界。
+
+    合并单元格不能被一条普通输入行从中间截断。用户在合并区域中的
+    任意行选择“上方/下方插入”时，分别落到合并块首行上方或末行下方，
+    这样新增后原有的 rowspan 和合并关系都能保持完整。
+    """
+    if target_id is None or position not in ('above', 'below'):
+        return target_id, position
+
+    cases = TestCase.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    cases.sort(key=_case_display_sort_key)
+    positions = {case.id: index for index, case in enumerate(cases)}
+    target_index = positions.get(target_id)
+    if target_index is None:
+        return target_id, position
+
+    boundary_index = target_index
+    merges = CaseMerge.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    for merge in merges:
+        member_positions = [
+            positions[case_id] for case_id in merge.get_case_ids()
+            if case_id in positions
+        ]
+        if len(member_positions) < 2 or target_index not in member_positions:
+            continue
+        if position == 'above':
+            boundary_index = min(boundary_index, min(member_positions))
+        else:
+            boundary_index = max(boundary_index, max(member_positions))
+
+    return cases[boundary_index].id, position
+
+
 # ------------------- 用例 -------------------
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/cases', methods=['GET'])
 def get_cases(project_id, version_id):
@@ -571,16 +882,23 @@ def get_cases(project_id, version_id):
     if page_size not in [20, 50, 100]:
         page_size = 20
     keyword = (request.args.get('keyword', '') or '').strip()
+    status_filter = (request.args.get('status', '') or '').strip()
+    status_filters = [value for value in status_filter.split(',') if value in STATUS_LIST]
 
-    init_system_columns(project_id)
+    init_system_columns(project_id, version_id)
     all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
     if any(case.sort_order in (None, 0) for case in all_cases):
         all_cases = normalize_case_order(project_id, version_id)
     else:
         all_cases.sort(key=_case_display_sort_key)
-    if normalize_case_merges(project_id, version_id, all_cases):
+    merges_changed = normalize_case_merges(project_id, version_id, all_cases)
+    if merges_changed:
+        db.session.flush()
+    if merges_changed or ensure_case_numbers(project_id, version_id, all_cases):
         db.session.commit()
     query = TestCase.query.filter_by(project_id=project_id, version_id=version_id)
+    if status_filters:
+        query = query.filter(TestCase.status.in_(status_filters))
     if keyword:
         # 支持多个关键词，要求每个关键词都能在当前用例的任意字段中找到；
         # 同时覆盖系统字段和自定义字段，避免搜索结果过窄。
@@ -604,9 +922,28 @@ def get_cases(project_id, version_id):
 
     total = query.count()
     cases = query.order_by(TestCase.sort_order.asc(), TestCase.id.asc()).offset((page - 1) * page_size).limit(page_size).all()
-    columns = CustomColumn.query.filter_by(project_id=project_id).order_by(CustomColumn.sort_order).all()
+    columns = query_version_columns(project_id, version_id)
     columns_dict = [c.to_dict() for c in columns]
     merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version_id).all()
+    all_cases_by_id = {case.id: case for case in all_cases}
+    system_column_keys = {column.key for column in columns if column.is_system}
+    merge_data = []
+    for merge in merges:
+        item = merge.to_dict()
+        # 合并单元格可能跨分页，前端仅凭当前页数据无法拼接完整内容。
+        # 随合并关系返回各成员原始值，避免合并后只显示首行内容。
+        values = {}
+        for case_id in merge.get_case_ids():
+            case = all_cases_by_id.get(case_id)
+            if not case:
+                continue
+            if merge.column_key in system_column_keys:
+                value = getattr(case, merge.column_key, '')
+            else:
+                value = case.get_custom_fields().get(merge.column_key, '')
+            values[str(case_id)] = value or ''
+        item['values'] = values
+        merge_data.append(item)
 
     data = {
         'total': total,
@@ -614,7 +951,7 @@ def get_cases(project_id, version_id):
         'page_size': page_size,
         'columns': columns_dict,
         'cases': [c.to_dict(columns_dict) for c in cases],
-        'merges': [merge.to_dict() for merge in merges]
+        'merges': merge_data
     }
     return jsonify({'success': True, 'data': data})
 
@@ -675,8 +1012,8 @@ def export_version_excel(project_id, version_id):
     if not version or not project:
         return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
 
-    init_system_columns(project_id)
-    columns = CustomColumn.query.filter_by(project_id=project_id, is_visible=True) \
+    init_system_columns(project_id, version_id)
+    columns = CustomColumn.query.filter_by(project_id=project_id, version_id=version_id, is_visible=True) \
         .order_by(CustomColumn.sort_order.asc(), CustomColumn.id.asc()).all()
     cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id) \
         .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
@@ -736,7 +1073,8 @@ def export_version_excel(project_id, version_id):
                 cell_value = re.sub(r'\[图片\]', '', cell_value).strip()
             cell = worksheet.cell(row=row_index, column=column_index, value=cell_value)
             cell.border = border
-            cell.alignment = Alignment(vertical='top', wrap_text=True)
+            horizontal = column.text_align if column.text_align in {'left', 'center', 'right'} else 'left'
+            cell.alignment = Alignment(horizontal=horizontal, vertical='top', wrap_text=True)
             cell.font = strike_font if re.search(r'<(?:s|strike|del)\b', str(raw_value or ''), re.IGNORECASE) else body_font
             if column.key == 'status':
                 cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -756,6 +1094,8 @@ def export_version_excel(project_id, version_id):
 
     # 将当前版本的纵向合并关系还原到导出表格，隐藏列对应的合并自然跳过。
     for merge in merges:
+        if merge.column_key == 'case_no':
+            continue
         rows = [case_row_map[case_id] for case_id in merge.get_case_ids() if case_id in case_row_map]
         column_index = column_index_map.get(merge.column_key)
         if not column_index or len(rows) < 2:
@@ -841,12 +1181,14 @@ def create_case():
     custom = data.get('custom_fields', {})
     if not isinstance(custom, dict):
         custom = {}
-    valid_keys = {c.key for c in CustomColumn.query.filter_by(project_id=project_id, is_system=False).all()}
+    valid_keys = {c.key for c in CustomColumn.query.filter_by(
+        project_id=project_id, version_id=version_id, is_system=False).all()}
     case.set_custom_fields({k: v for k, v in (custom or {}).items() if k in valid_keys})
 
     db.session.add(case)
+    ensure_case_numbers(project_id, version_id)
     db.session.commit()
-    columns = CustomColumn.query.filter_by(project_id=project_id).order_by(CustomColumn.sort_order).all()
+    columns = query_version_columns(project_id, version_id)
     return jsonify({'success': True, 'data': case.to_dict([c.to_dict() for c in columns])})
 
 
@@ -867,7 +1209,11 @@ def create_cases_batch():
     except (TypeError, ValueError):
         target_id = None
     position = data.get('insert_position')  # 'above' 或 'below'
-    valid_keys = {c.key for c in CustomColumn.query.filter_by(project_id=project_id, is_system=False).all()}
+    valid_keys = {c.key for c in CustomColumn.query.filter_by(
+        project_id=project_id, version_id=version_id, is_system=False).all()}
+    target_id, position = normalize_merge_insert_target(
+        project_id, version_id, target_id, position
+    )
     sort_orders = compute_sort_orders(project_id, version_id, target_id, position, len(cases_data))
     next_number = next_case_number(project_id, version_id)
 
@@ -907,19 +1253,27 @@ def create_cases_batch():
     ordered_cases = normalize_case_order(project_id, version_id, reset_numbers=True)
     inserted_ids = {case.id for case in created}
     if target_id and inserted_ids:
-        # 目标位于纵向合并区域时，新行也必须加入该合并关系；否则 rowspan
-        # 会跨过新行，导致后续行少一个 td、整行向左错位。
+        # 只有插入块位于原合并区域的内部时，才把新行加入合并关系。
+        # 插在合并首行上方或末行下方时，新行属于合并区域外，不能仅因
+        # 目标行属于合并区域就扩大 rowspan，否则会造成页面列错位。
+        positions = {case.id: index for index, case in enumerate(ordered_cases)}
         for merge in CaseMerge.query.filter_by(
                 project_id=project_id, version_id=version_id).all():
             existing_ids = set(merge.get_case_ids())
-            if target_id not in existing_ids:
+            existing_positions = [positions[case_id] for case_id in existing_ids
+                                  if case_id in positions]
+            inserted_positions = [positions[case_id] for case_id in inserted_ids
+                                  if case_id in positions]
+            if (not existing_positions or not inserted_positions
+                    or min(inserted_positions) <= min(existing_positions)
+                    or max(inserted_positions) >= max(existing_positions)):
                 continue
             merge.set_case_ids([
                 case.id for case in ordered_cases
                 if case.id in existing_ids or case.id in inserted_ids
             ])
     db.session.commit()
-    columns = CustomColumn.query.filter_by(project_id=project_id).order_by(CustomColumn.sort_order).all()
+    columns = query_version_columns(project_id, version_id)
     columns_dict = [c.to_dict() for c in columns]
     return jsonify({'success': True, 'data': [c.to_dict(columns_dict) for c in created]})
 
@@ -945,13 +1299,14 @@ def update_case(case_id):
     if not isinstance(custom, dict):
         custom = {}
     with db.session.no_autoflush:
-        valid_keys = {c.key for c in CustomColumn.query.filter_by(project_id=case.project_id, is_system=False).all()}
+        valid_keys = {c.key for c in CustomColumn.query.filter_by(
+            project_id=case.project_id, version_id=case.version_id, is_system=False).all()}
     merged = case.get_custom_fields()
     merged.update({k: v for k, v in custom.items() if k in valid_keys})
     case.set_custom_fields(merged)
 
     db.session.commit()
-    columns = CustomColumn.query.filter_by(project_id=case.project_id).order_by(CustomColumn.sort_order).all()
+    columns = query_version_columns(case.project_id, case.version_id)
     return jsonify({'success': True, 'data': case.to_dict([c.to_dict() for c in columns])})
 
 
@@ -965,6 +1320,8 @@ def delete_case(case_id):
         else:
             merge.set_case_ids(remaining_ids)
     db.session.delete(case)
+    db.session.flush()
+    normalize_case_order(case.project_id, case.version_id, reset_numbers=True)
     db.session.commit()
     return jsonify({'success': True})
 
@@ -988,6 +1345,11 @@ def delete_cases_batch():
             else:
                 merge.set_case_ids(remaining_ids)
         db.session.delete(case)
+    db.session.flush()
+    for project_id, version_id in {
+        (case.project_id, case.version_id) for case in cases
+    }:
+        normalize_case_order(project_id, version_id, reset_numbers=True)
     db.session.commit()
     return jsonify({'success': True, 'data': {'deleted': len(cases)}})
 
@@ -995,10 +1357,14 @@ def delete_cases_batch():
 # ------------------- 统计 -------------------
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/stats', methods=['GET'])
 def get_stats(project_id, version_id):
-    total = TestCase.query.filter_by(project_id=project_id, version_id=version_id).count()
+    all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+    logical_cases = [group[0] for group in logical_case_groups(
+        project_id, version_id, all_cases
+    ) if group]
+    total = len(logical_cases)
     stats = {}
     for status in STATUS_LIST:
-        count = TestCase.query.filter_by(project_id=project_id, version_id=version_id, status=status).count()
+        count = sum(1 for case in logical_cases if case.status == status)
         stats[status] = {
             'count': count,
             'percent': round(count / total * 100, 1) if total else 0
@@ -1014,21 +1380,41 @@ def get_stats(project_id, version_id):
 
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/summary', methods=['GET'])
 def get_summary(project_id, version_id):
-    total = TestCase.query.filter_by(project_id=project_id, version_id=version_id).count()
+    all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+    logical_cases = [group[0] for group in logical_case_groups(
+        project_id, version_id, all_cases
+    ) if group]
+    total = len(logical_cases)
     counts = {}
     for status in STATUS_LIST:
-        counts[status] = TestCase.query.filter_by(project_id=project_id, version_id=version_id, status=status).count()
+        counts[status] = sum(1 for case in logical_cases if case.status == status)
 
     executed = total - counts['跳过'] - counts['阻塞']
-    skip_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id, status='跳过').all()
-    block_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id, status='阻塞').all()
+    fail_cases = [case for case in logical_cases if case.status == '失败']
+    skip_cases = [case for case in logical_cases if case.status == '跳过']
+    block_cases = [case for case in logical_cases if case.status == '阻塞']
+
+    def summary_text(value):
+        """把富文本备注转换为总结用纯文本，图片只从总结中排除。"""
+        value = str(value or '')
+        value = re.sub(r'<img\b[^>]*>', '', value, flags=re.IGNORECASE)
+        value = re.sub(r'<br\s*/?>', '\n', value, flags=re.IGNORECASE)
+        value = re.sub(r'</(?:div|p)>', '\n', value, flags=re.IGNORECASE)
+        value = re.sub(r'<[^>]+>', '', value)
+        value = html.unescape(value)
+        value = re.sub(r'[ \t]+\n', '\n', value)
+        return value.strip()
 
     def reasons(cases):
         result = []
         for c in cases:
-            remark = (c.remark or '').strip()
-            if remark:
-                result.append({'id': c.id, 'case_no': c.case_no, 'title': c.title, 'reason': remark})
+            remark = summary_text(c.remark)
+            result.append({
+                'id': c.id,
+                'case_no': c.case_no,
+                'title': c.title,
+                'reason': remark or '未填写问题描述',
+            })
         return result
 
     return jsonify({
@@ -1041,6 +1427,7 @@ def get_summary(project_id, version_id):
             'block': counts['阻塞'],
             'skip': counts['跳过'],
             'unexecuted': counts['未执行'],
+            'fail_reasons': reasons(fail_cases),
             'skip_reasons': reasons(skip_cases),
             'block_reasons': reasons(block_cases),
             'can_summarize': counts['未执行'] == 0 and total > 0
@@ -1215,6 +1602,58 @@ def excel_cell_to_text(cell, preserve_strike=True):
     return text_value
 
 
+class LegacyExcelCell:
+    """给旧版 .xls 单元格提供 openpyxl 读取代码所需的最小接口。"""
+
+    def __init__(self, value, strike=False):
+        self.value = value
+        self.font = type('LegacyFont', (), {'strike': strike})()
+
+
+def load_legacy_xls(raw_bytes):
+    """读取旧版二进制 .xls，转换为当前导入流程使用的单元格结构。"""
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise ValueError('检测到旧版 .xls 文件，请先执行 pip install -r requirements.txt') from exc
+
+    try:
+        book = xlrd.open_workbook(file_contents=raw_bytes, formatting_info=True)
+        sheet = book.sheet_by_index(0)
+    except Exception as exc:
+        raise ValueError('Excel 文件损坏，或文件扩展名与实际格式不一致') from exc
+
+    def cell_at(row_index, col_index):
+        cell = sheet.cell(row_index, col_index)
+        strike = False
+        try:
+            xf = book.xf_list[cell.xf_index]
+            strike = bool(book.font_list[xf.font_index].struck_out)
+        except Exception:
+            pass
+        return LegacyExcelCell(cell.value, strike)
+
+    rows = [
+        [cell_at(row_index, col_index) for col_index in range(sheet.ncols)]
+        for row_index in range(sheet.nrows)
+    ]
+    last_data_row = max(
+        (row_index + 1 for row_index, row in enumerate(rows)
+         if any(cell.value is not None and str(cell.value).strip() for cell in row)),
+        default=1
+    )
+    merge_ranges = []
+    for row_start, row_end, col_start, col_end in sheet.merged_cells:
+        merge_ranges.append(CellRange(
+            min_col=col_start + 1,
+            min_row=row_start + 1,
+            max_col=col_end,
+            max_row=row_end,
+        ))
+        last_data_row = max(last_data_row, row_end)
+    return book, rows, last_data_row, merge_ranges
+
+
 def next_case_number(project_id, version_id):
     """返回该版本下下一个可用的数字用例编号。"""
     case_nos = db.session.query(TestCase.case_no).filter_by(
@@ -1251,22 +1690,37 @@ def import_cases(project_id, version_id):
         return jsonify({'success': False, 'message': '未上传文件'}), 400
 
     wb = None
+    legacy_book = None
     try:
         version = Version.query.filter_by(id=version_id, project_id=project_id).first()
         if not version:
             return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
-        init_system_columns(project_id)
+        init_system_columns(project_id, version_id)
 
         # Werkzeug 的部分上传流（尤其是 SpooledTemporaryFile 包装对象）不一定
-        # 实现 seekable()，先复制到标准 BytesIO，兼容 XML 扫描和 openpyxl 只读模式。
-        excel_stream = io.BytesIO(file.read())
-        last_data_row, worksheet_merges = inspect_excel_bounds(excel_stream)
-        wb = openpyxl.load_workbook(excel_stream, read_only=True, data_only=False)
-        ws = wb.active
-        header_row = next(
-            ws.iter_rows(min_row=1, max_row=1, max_col=ws.max_column, values_only=True),
-            ()
-        )
+        # 实现 seekable()，先复制到标准 BytesIO。根据文件头区分 .xlsx 和旧版 .xls。
+        raw_bytes = file.read()
+        if raw_bytes.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'):
+            legacy_book, legacy_rows, last_data_row, worksheet_merges = load_legacy_xls(raw_bytes)
+            header_row = legacy_rows[0] if legacy_rows else ()
+            rows = legacy_rows[:last_data_row]
+        else:
+            if not raw_bytes.startswith(b'PK'):
+                raise ValueError('上传文件不是有效的 Excel 文件，请选择 .xlsx 或 .xls 文件')
+            excel_stream = io.BytesIO(raw_bytes)
+            try:
+                last_data_row, worksheet_merges = inspect_excel_bounds(excel_stream)
+                wb = openpyxl.load_workbook(excel_stream, read_only=True, data_only=False)
+            except (BadZipFile, KeyError, ValueError, OSError) as exc:
+                raise ValueError(
+                    'Excel 文件格式不完整或已损坏，请重新保存为标准 .xlsx 后再导入'
+                ) from exc
+            ws = wb.active
+            header_row = next(
+                ws.iter_rows(min_row=1, max_row=1, max_col=ws.max_column, values_only=True),
+                ()
+            )
+            rows = [header_row]
         if not header_row:
             return jsonify({'success': False, 'message': 'Excel 为空或缺少表头'}), 400
 
@@ -1286,8 +1740,9 @@ def import_cases(project_id, version_id):
         if len(set(headers)) != len(headers):
             return jsonify({'success': False, 'message': '第一行存在重复表头，请先修改后再导入'}), 400
 
-        rows = [header_row]
-        if last_data_row >= 2:
+        # .xlsx 已按表头列数读取；.xls 则在这里截掉格式残留列。
+        rows = [list(row[:len(headers)]) for row in rows]
+        if wb is not None and last_data_row >= 2:
             rows.extend(ws.iter_rows(
                 min_row=2,
                 max_row=last_data_row,
@@ -1301,9 +1756,11 @@ def import_cases(project_id, version_id):
         system_indexes = {mapped for _, _, mapped in mapped_headers if mapped}
         custom_cols = [(idx, header) for idx, header, mapped in mapped_headers if not mapped]
 
-        existing_custom = {c.key: c for c in CustomColumn.query.filter_by(project_id=project_id, is_system=False).all()}
+        existing_custom = {c.key: c for c in CustomColumn.query.filter_by(
+            project_id=project_id, version_id=version_id, is_system=False).all()}
         existing_custom_by_name = {c.name: c for c in existing_custom.values()}
-        max_order = db.session.query(db.func.max(CustomColumn.sort_order)).filter_by(project_id=project_id).scalar() or 0
+        max_order = db.session.query(db.func.max(CustomColumn.sort_order)).filter_by(
+            project_id=project_id, version_id=version_id).scalar() or 0
         imported_keys = []
         imported_custom_keys = {}
         for idx, h in custom_cols:
@@ -1320,6 +1777,7 @@ def import_cases(project_id, version_id):
             if key not in existing_custom:
                 col = CustomColumn(
                     project_id=project_id,
+                    version_id=version_id,
                     name=h,
                     key=key,
                     is_system=False,
@@ -1334,7 +1792,8 @@ def import_cases(project_id, version_id):
         db.session.flush()
 
         # 导入后让表格列与 Excel 表头一致；执行结果仍保留为固定列。
-        all_cols = CustomColumn.query.filter_by(project_id=project_id).all()
+        all_cols = CustomColumn.query.filter_by(
+            project_id=project_id, version_id=version_id).all()
         system_cols = [c for c in all_cols if c.is_system]
         for c in system_cols:
             c.is_visible = c.key in system_indexes or c.key == 'status'
@@ -1430,6 +1889,9 @@ def import_cases(project_id, version_id):
         }
         for merged in vertical_merges:
             column_key = imported_keys_by_column.get(merged.min_col)
+            # 用例编号按真实用例行编号，不能继承 Excel 中的纵向编号合并。
+            if column_key == 'case_no':
+                continue
             case_ids = [
                 imported_case_ids_by_row[row_number]
                 for row_number in range(merged.min_row, merged.max_row + 1)
@@ -1452,6 +1914,8 @@ def import_cases(project_id, version_id):
                 imported_merge.set_case_ids(case_ids)
                 db.session.add(imported_merge)
 
+        # 导入后按真实用例行重置编号，Excel 中的合并行不参与计数。
+        normalize_case_order(project_id, version_id, reset_numbers=True)
         db.session.commit()
         return jsonify({'success': True, 'data': {'imported': created_count}})
     except Exception as e:
@@ -1460,6 +1924,8 @@ def import_cases(project_id, version_id):
     finally:
         if wb is not None:
             wb.close()
+        if legacy_book is not None:
+            legacy_book.release_resources()
 
 
 # ------------------- 图片上传 -------------------
@@ -1572,7 +2038,7 @@ def backup_database():
 @app.cli.command('init-db')
 def init_db_command():
     create_database()
-    db.create_all()
+    initialize_auth_data()
     migrate_sort_order()
     print('数据库初始化完成')
 
@@ -1590,6 +2056,11 @@ def migrate_sort_order():
                     conn.execute(text(f"ALTER TABLE test_cases ADD COLUMN {column} {definition}"))
                 except Exception:
                     pass  # 字段已存在
+            try:
+                conn.execute(text("ALTER TABLE custom_columns ADD COLUMN text_align VARCHAR(10) NOT NULL DEFAULT 'left'"))
+            except Exception:
+                pass  # 字段已存在
+            conn.execute(text("UPDATE custom_columns SET text_align = 'left' WHERE text_align IS NULL OR text_align = ''"))
             try:
                 conn.execute(text("ALTER TABLE test_cases ADD COLUMN sort_order INT DEFAULT 0"))
             except Exception:
@@ -1621,11 +2092,96 @@ def migrate_sort_order():
             conn.commit()
     except Exception as e:
         print('sort_order 迁移提示:', e)
+    migrate_version_columns()
+
+
+def migrate_version_columns():
+    """把历史项目级列迁移为版本级列，并修复导入造成的跨版本覆盖。"""
+    try:
+        with db.engine.begin() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE custom_columns ADD COLUMN version_id INT NULL AFTER project_id"
+                ))
+            except Exception:
+                pass  # 字段已存在
+
+        db.session.expire_all()
+        versions_by_project = {}
+        for version in Version.query.order_by(Version.project_id, Version.sort_order, Version.id).all():
+            versions_by_project.setdefault(version.project_id, []).append(version)
+
+        for project_id, versions in versions_by_project.items():
+            legacy = CustomColumn.query.filter_by(
+                project_id=project_id, version_id=None
+            ).order_by(CustomColumn.sort_order.asc(), CustomColumn.id.asc()).all()
+            if not legacy:
+                continue
+
+            # 导入 CAN 表格前，旧版本没有自定义字段；当前遗留列中带有
+            # 自定义列时，将其保留给拥有自定义数据的版本，其他版本恢复系统列。
+            custom_case_counts = {
+                version.id: TestCase.query.filter(
+                    TestCase.project_id == project_id,
+                    TestCase.version_id == version.id,
+                    TestCase.custom_fields.isnot(None),
+                    TestCase.custom_fields != '{}',
+                ).count()
+                for version in versions
+            }
+            imported_version = max(
+                versions,
+                key=lambda version: custom_case_counts.get(version.id, 0)
+            ) if versions else None
+            has_custom_legacy = any(not column.is_system for column in legacy)
+
+            if imported_version and has_custom_legacy and custom_case_counts.get(imported_version.id, 0):
+                # 当前数据库中这批遗留列就是 CAN 导入产生的列配置。
+                for column in legacy:
+                    column.version_id = imported_version.id
+                for version in versions:
+                    if version.id == imported_version.id:
+                        continue
+                    for index, system in enumerate(SYSTEM_COLUMNS):
+                        db.session.add(CustomColumn(
+                            project_id=project_id,
+                            version_id=version.id,
+                            name=system['name'],
+                            key=system['key'],
+                            is_system=True,
+                            is_visible=True,
+                            width=system['width'],
+                            sort_order=index,
+                            text_align='left',
+                        ))
+            else:
+                # 其他历史项目原本所有版本共用一套列配置，先保留给第一个版本，
+                # 再为其余版本复制一份，确保后续设置互不影响。
+                first_version = versions[0]
+                for column in legacy:
+                    column.version_id = first_version.id
+                for version in versions[1:]:
+                    for source in legacy:
+                        db.session.add(CustomColumn(
+                            project_id=project_id,
+                            version_id=version.id,
+                            name=source.name,
+                            key=source.key,
+                            is_system=source.is_system,
+                            is_visible=source.is_visible,
+                            width=source.width,
+                            sort_order=source.sort_order,
+                            text_align=source.text_align or 'left',
+                        ))
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        print('version_columns 迁移提示:', exc)
 
 
 if __name__ == '__main__':
     with app.app_context():
         create_database()
-        db.create_all()
+        initialize_auth_data()
         migrate_sort_order()
     app.run(host='0.0.0.0', port=5005, debug=True)

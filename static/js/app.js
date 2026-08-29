@@ -1,4 +1,4 @@
-let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],cases:[],merges:[],page:1,pageSize:20,total:0,keyword:'',editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,sidebarCollapsed:false,quickAddRow:false,currentUser:null,quickInsertTarget:null,quickInsertCount:1,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false};
+let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],cases:[],merges:[],page:1,pageSize:20,total:0,keyword:'',statusFilters:[],editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,sidebarCollapsed:false,quickAddRow:false,actionsCollapsed:false,currentUser:null,quickInsertTarget:null,quickInsertCount:1,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false};
 let draggedVersion=null;
 let versionJustDragged=false;
 const STATUS_LIST=['通过','失败','未执行','阻塞','跳过'];
@@ -10,6 +10,26 @@ function escapeHtml(value){return (value??'').toString().replace(/&/g,'&amp;').r
 function normalizeStatus(value){
   const raw=(value??'').toString().trim();
   return STATUS_ALIASES[raw.toLowerCase()]||raw;
+}
+function updateStatusFilterUI(){
+  const container=$('#status-filter');
+  const trigger=$('#status-filter-trigger');
+  if(!container||!trigger)return;
+  const selected=state.statusFilters||[];
+  trigger.textContent=selected.length?`执行结果：${selected.join('、')}`:'执行结果：全部';
+  container.querySelectorAll('input[name="status-filter-option"]').forEach(input=>{
+    input.checked=selected.includes(input.value);
+  });
+}
+function toggleStatusFilter(){
+  const container=$('#status-filter');
+  if(container)container.classList.toggle('open');
+}
+function onStatusFilterChange(){
+  state.statusFilters=Array.from(document.querySelectorAll('input[name="status-filter-option"]:checked')).map(input=>input.value);
+  updateStatusFilterUI();
+  state.page=1;
+  loadCases();
 }
 let projectNameTooltip=null;
 function hideProjectNameTooltip(){
@@ -73,18 +93,43 @@ async function doLogin(){
 }
 
 function applyRoleUI(){
-  const isAdmin=state.currentUser?.role==='admin';
+  const isAdmin=state.currentUser?.can_manage===true;
+  const isReadonly=state.currentUser?.can_write!==true;
+  const roleHint=$('#current-user-role');
+  if(roleHint){
+    const user=state.currentUser||{};
+    const roleName=user.role_name||'未识别角色';
+    const permission=isAdmin?'可管理项目、版本、用例和备份':isReadonly?'仅可查看和导出':'可编辑用例和执行结果';
+    roleHint.textContent=`当前账号：${user.username||''}｜${roleName}｜${permission}`;
+    roleHint.className=`account-role-hint ${isAdmin?'role-admin':isReadonly?'role-readonly':'role-test'}`;
+  }
   $$('.admin-only').forEach(el=>el.style.display=isAdmin?'inline-flex':'none');
+  ['btn-add-project','btn-add-version','btn-quick-add','btn-add-case','btn-batch-delete',
+   'btn-merge-cells','btn-unmerge-cells','btn-import','btn-columns','edit-mode-toggle']
+    .forEach(id=>{const el=$(`#${id}`);if(el)el.disabled=isReadonly;});
+  if(isReadonly){
+    state.editMode=false;
+    const toggle=$('#edit-mode-toggle');if(toggle)toggle.checked=false;
+  }
+  updateEditModeUI();
 }
 $('#login-form').addEventListener('submit',e=>{e.preventDefault();doLogin();});
 
 async function initApp(){
   await loadProjects();
   if(state.projects.length){
-    const p=state.projects[0];
-    state.expandedProjects.add(p.id);state.currentProject=p;
-    await loadVersionsForProject(p.id);renderProjects();
+    // 登录后优先进入第一个有版本的项目，避免最新创建的空项目
+    // 让用户误以为当前账号没有数据；项目和版本数据仍按账号权限从接口读取。
+    let selectedProject=null;
+    for(const project of state.projects){
+      await loadVersionsForProject(project.id);
+      if(!selectedProject&&(state.versions[project.id]||[]).length)selectedProject=project;
+    }
+    const p=selectedProject||state.projects[0];
+    state.expandedProjects.add(p.id);state.currentProject=p;renderProjects();
     $('#current-project-name').textContent=p.name;
+    const firstVersion=(state.versions[p.id]||[])[0];
+    if(firstVersion)await selectVersion(firstVersion.id,p.id);
   }else{renderProjects();}
 }
 
@@ -97,7 +142,7 @@ function renderProjects(){
   if(!state.projects.length){list.innerHTML='<div class="empty-state" style="padding:20px">暂无项目</div>';return;}
   state.projects.forEach(p=>{
     const expanded=state.expandedProjects.has(p.id);
-    const canManage=state.editMode&&state.currentUser?.role==='admin';
+    const canManage=state.editMode&&state.currentUser?.can_manage===true;
     const node=document.createElement('div');node.className='project-node';
     node.innerHTML=`<div class="project-header ${state.currentProject?.id===p.id?'active':''}" onclick="toggleProject(${p.id})">
       <span class="project-arrow ${expanded?'expanded':''}">▶</span>
@@ -128,7 +173,7 @@ function renderProjects(){
             selectVersion(v.id,p.id);
           };
           vi.addEventListener('contextmenu',e=>{
-            if(!state.editMode||state.currentUser?.role!=='admin')return;
+            if(!state.editMode||state.currentUser?.can_manage!==true)return;
             e.preventDefault();e.stopPropagation();showVersionContextMenu(e,p.id,v.id);
           });
           if(state.editMode){
@@ -173,7 +218,19 @@ async function saveVersionOrder(projectId,list){
 }
 
 async function toggleProject(id){
-  if(state.expandedProjects.has(id)){state.expandedProjects.delete(id);}else{state.expandedProjects.add(id);state.currentProject=state.projects.find(p=>p.id===id);await loadVersionsForProject(id);}
+  const project=state.projects.find(p=>p.id===id);
+  if(!project)return;
+  const switchingProject=state.currentProject?.id!==id;
+  if(switchingProject){
+    state.currentProject=project;
+    state.currentVersion=null;
+    state.columns=[];state.cases=[];state.merges=[];state.total=0;state.page=1;
+    state.quickAddRow=false;state.quickInsertTarget=null;state.mergeMode=false;state.mergeAnchor=null;
+    $('#current-version-name').textContent='';
+    $('#stats-bar').innerHTML='<span>共 0 条</span>';
+    renderTable();renderPagination();
+  }
+  if(state.expandedProjects.has(id)){state.expandedProjects.delete(id);}else{state.expandedProjects.add(id);await loadVersionsForProject(id);}
   renderProjects();$('#current-project-name').textContent=state.currentProject?.name||'未选择项目';
 }
 
@@ -187,7 +244,10 @@ async function selectVersion(id,projectId=null){
   if(!project)return;
   state.currentProject=project;
   const versions=state.versions[targetProjectId]||[];
-  state.currentVersion=versions.find(v=>v.id===id);state.page=1;
+  // 版本 ID 在全库唯一，但请求必须同时使用它所属的项目 ID，防止
+  // 切换项目过程中残留旧项目状态，生成 /projects/A/versions/B 的错误地址。
+  state.currentVersion=versions.find(v=>Number(v.id)===Number(id)&&Number(v.project_id)===Number(targetProjectId));
+  state.page=1;state.statusFilters=[];updateStatusFilterUI();
   if(!state.currentVersion)return;
   await Promise.all([loadColumns(),loadCases(),loadStats()]);
   renderProjects();
@@ -280,13 +340,15 @@ async function deleteVersion(projectId,versionId){
 }
 
 async function loadColumns(){
-  const res=await api(`/api/projects/${state.currentProject.id}/columns`);state.columns=(res.data||[]).sort((a,b)=>a.sort_order-b.sort_order);
+  if(!state.currentProject||!state.currentVersion){state.columns=[];return;}
+  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`);state.columns=(res.data||[]).sort((a,b)=>a.sort_order-b.sort_order);
 }
 function visibleColumns(){return state.columns.filter(c=>c.is_visible);}
 
 async function loadCases(){
   if(!state.currentVersion)return;
-  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/cases?page=${state.page}&page_size=${state.pageSize}&keyword=${encodeURIComponent(state.keyword)}`);
+  const statusQuery=state.statusFilters.join(',');
+  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/cases?page=${state.page}&page_size=${state.pageSize}&keyword=${encodeURIComponent(state.keyword)}&status=${encodeURIComponent(statusQuery)}`);
   state.cases=res.data.cases||[];state.total=res.data.total||0;state.columns=res.data.columns||state.columns;state.merges=res.data.merges||[];renderTable();renderPagination();
 }
 
@@ -314,6 +376,15 @@ function openSummaryModal(){
   if(btn.disabled)return;
   const d=JSON.parse(btn.dataset.summary||'{}');
   const body=$('#summary-body');
+  const renderProblems=(title,items)=>`
+    <div class="summary-section">
+      <h4>${title}（${items.length}）</h4>
+      ${items.length?'<ol>'+items.map(item=>{
+        const caseNo=escapeHtml(item.case_no||'未编号');
+        const caseTitle=escapeHtml(item.title||'未命名用例');
+        return `<li><span class="summary-case-title">${caseTitle}</span>：${escapeHtml(item.reason||'未填写问题描述')}（${caseNo}）</li>`;
+      }).join('')+'</ol>':'<p class="empty">无</p>'}
+    </div>`;
   body.innerHTML=`
     <div class="summary-cards">
       <div class="summary-card"><div class="summary-num">${d.total}</div><div>总用例</div></div>
@@ -323,14 +394,9 @@ function openSummaryModal(){
       <div class="summary-card block"><div class="summary-num">${d.block}</div><div>阻塞</div></div>
       <div class="summary-card skip"><div class="summary-num">${d.skip}</div><div>跳过</div></div>
     </div>
-    <div class="summary-section">
-      <h4>阻塞原因（${(d.block_reasons||[]).length}）</h4>
-      ${(d.block_reasons||[]).length?'<ol>'+d.block_reasons.map(r=>`<li><b>${r.case_no?r.case_no+' ':''}${r.title}</b>：${r.reason}</li>`).join('')+'</ol>':'<p class="empty">无</p>'}
-    </div>
-    <div class="summary-section">
-      <h4>跳过原因（${(d.skip_reasons||[]).length}）</h4>
-      ${(d.skip_reasons||[]).length?'<ol>'+d.skip_reasons.map(r=>`<li><b>${r.case_no?r.case_no+' ':''}${r.title}</b>：${r.reason}</li>`).join('')+'</ol>':'<p class="empty">无</p>'}
-    </div>
+    ${renderProblems('失败问题',d.fail_reasons||[])}
+    ${renderProblems('阻塞问题',d.block_reasons||[])}
+    ${renderProblems('跳过问题',d.skip_reasons||[])}
   `;
   openModal('#summary-modal');
 }
@@ -338,10 +404,18 @@ function openSummaryModal(){
 function renderTable(){
   if(state.quickAddRow){renderQuickAddRows();return;}
   const cols=visibleColumns();const thead=$('#case-table thead');const tbody=$('#case-table tbody');
-  const showActions=state.editMode;
-  const showSelection=state.editMode;
+  const hasVersion=Boolean(state.currentVersion);
+  const showActions=state.editMode&&hasVersion;
+  const showSelection=state.editMode&&hasVersion;
+  if(!hasVersion){
+    thead.innerHTML='';
+    tbody.innerHTML='<tr><td class="empty-state no-version-state">该项目暂无版本，请先新建版本</td></tr>';
+    updateSelectedCaseCount();
+    return;
+  }
   const ths=cols.map(c=>`<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${c.width}px"><span class="col-title">${escapeHtml(c.name)}</span>${state.editMode?'<div class="resize-handle"></div>':''}</th>`).join('');
-  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"><input type="checkbox" id="select-all-cases" title="全选当前页" onchange="toggleAllCases(this.checked)"></th>':''}${ths}${showActions?'<th class="actions-header" style="width:150px">操作</th>':''}</tr>`;
+  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"><input type="checkbox" id="select-all-cases" title="全选当前页" onchange="toggleAllCases(this.checked)"></th>':''}${ths}${showActions?renderActionsHeader():''}</tr>`;
+  bindColumnContextMenu();
   tbody.innerHTML='';
   if(!state.cases.length){tbody.innerHTML=`<tr><td colspan="${cols.length+(showActions?1:0)+(showSelection?1:0)}" class="empty-state">暂无数据</td></tr>`;return;}
   const pageIds=state.cases.map(tc=>tc.id);
@@ -350,7 +424,7 @@ function renderTable(){
     const tr=document.createElement('tr');
     tr.dataset.caseId=tc.id;
     tr.addEventListener('contextmenu',showRowContextMenu);
-    tr.innerHTML=`${showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:''}${cells.join('')}${showActions?`<td class="actions-cell">${renderRowActions(tc.id)}</td>`:''}`;
+    tr.innerHTML=`${showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:''}${cells.join('')}${showActions?renderActionsCell(tc.id):''}`;
     tbody.appendChild(tr);
   });
   if(state.editMode)bindColumnResize();
@@ -387,7 +461,24 @@ function renderRowActions(id){
   return `<button class="secondary" onclick="editCase(${id})">编辑</button><button class="danger" onclick="deleteCase(${id})">删除</button>`;
 }
 
+function renderActionsHeader(){
+  const collapsed=state.actionsCollapsed;
+  return `<th class="actions-header ${collapsed?'actions-collapsed':''}"><div class="actions-header-content"><span class="actions-header-title">操作</span><button type="button" class="actions-toggle" onclick="toggleActionsColumn(event)" title="${collapsed?'展开操作列':'收缩操作列'}">${collapsed?'展开':'收缩'}</button></div></th>`;
+}
+
+function renderActionsCell(id){
+  return `<td class="actions-cell ${state.actionsCollapsed?'actions-collapsed':''}">${state.actionsCollapsed?'':renderRowActions(id)}</td>`;
+}
+
+function toggleActionsColumn(event){
+  event?.stopPropagation();
+  if(state.quickAddRow){showToast('请先保存或取消新增行','error');return;}
+  state.actionsCollapsed=!state.actionsCollapsed;
+  renderTable();
+}
+
 function showRowContextMenu(e){
+  if(!state.editMode)return;
   e.preventDefault();
   const caseId=e.currentTarget.dataset.caseId;
   removeContextMenu();
@@ -404,34 +495,170 @@ function showRowContextMenu(e){
 }
 
 function removeContextMenu(){
-  const m=$('#row-context-menu');if(m)m.remove();
+  ['row-context-menu','column-context-menu'].forEach(id=>{const menu=$(`#${id}`);if(menu)menu.remove();});
+}
+
+function bindColumnContextMenu(){
+  if(!state.editMode)return;
+  $('#case-table thead')?.querySelectorAll('th[data-key]').forEach(th=>{
+    th.addEventListener('contextmenu',e=>showColumnContextMenu(e,th.dataset.key,Number(th.dataset.id)));
+  });
+}
+
+function showColumnContextMenu(e,key,columnId){
+  if(!state.editMode)return;
+  e.preventDefault();
+  removeContextMenu();
+  const column=state.columns.find(col=>col.id===columnId||col.key===key);
+  if(!column)return;
+  const menu=document.createElement('div');
+  menu.id='column-context-menu';menu.className='context-menu';
+  menu.innerHTML='<div data-align="left">整列靠左</div><div data-align="center">整列居中</div><div data-align="right">整列靠右</div>';
+  menu.querySelectorAll('[data-align]').forEach(item=>{
+    item.addEventListener('click',()=>applyColumnAlignment(column.id,item.dataset.align));
+  });
+  document.body.appendChild(menu);
+  const gap=6;
+  menu.style.left=`${Math.min(e.pageX,window.scrollX+window.innerWidth-menu.offsetWidth-gap)}px`;
+  menu.style.top=`${Math.min(e.pageY,window.scrollY+window.innerHeight-menu.offsetHeight-gap)}px`;
+  document.addEventListener('click',removeContextMenu,{once:true});
+}
+
+async function applyColumnAlignment(columnId,alignment){
+  if(!['left','center','right'].includes(alignment))return;
+  const column=state.columns.find(col=>col.id===columnId);
+  if(!column)return;
+  try{
+    await api(`/api/columns/${columnId}`,{method:'PUT',body:JSON.stringify({text_align:alignment})});
+    column.text_align=alignment;
+    removeContextMenu();
+    renderTable();
+    showToast(`“${column.name}”已整列${alignment==='left'?'靠左':alignment==='center'?'居中':'靠右'}`);
+  }catch(err){showToast(err.message,'error');}
 }
 
 function findMerge(c,caseId){return state.merges.find(merge=>merge.column_key===c.key&&(merge.case_ids||[]).includes(caseId));}
 
+function activeVersionScope(){
+  const version=state.currentVersion;
+  const project=state.currentProject;
+  if(!version||!project||Number(version.project_id)!==Number(project.id))return null;
+  return {projectId:Number(version.project_id),versionId:Number(version.id)};
+}
+
+function columnTextAlign(c){return ['left','center','right'].includes(c?.text_align)?c.text_align:'left';}
+function getCaseColumnValue(tc,col){
+  if(!tc||!col)return '';
+  if(col.is_system)return tc[col.key]??'';
+  return tc[col.key]??tc.custom_fields?.[col.key]??'';
+}
+
+function renderMergedContinuationCell(c,tc){
+  const selected=state.mergeAnchor?.key===c.key&&state.mergeAnchor?.caseId===tc.id;
+  const selectAttr=state.mergeMode
+    ? ` onclick="selectMergeCell(event,'${escapeHtml(c.key)}',${tc.id})"`
+    : '';
+  return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="merged-cell merge-continuation ${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor ':''}" style="text-align:${columnTextAlign(c)};vertical-align:middle"${selectAttr} title=""></td>`;
+}
+
+function getMergedCellValue(c,merge){
+  const values=(merge.case_ids||[]).map(caseId=>{
+    const member=state.cases.find(item=>item.id===caseId);
+    if(member)return getCaseColumnValue(member,c);
+    return merge.values?.[String(caseId)]??merge.values?.[caseId]??'';
+  }).filter(value=>value!==null&&value!==undefined&&String(value).trim()!=='');
+  if(!values.length)return '';
+  // 纯文本使用换行；混合富文本时，先转义普通文本再插入换行，避免把
+  // 用户输入的 <、> 当成 HTML，同时保留图片和删除线等已有富文本。
+  if(values.some(value=>isRichTextValue(value))){
+    return values.map(value=>isRichTextValue(value)?String(value):escapeHtml(value)).join('<br>');
+  }
+  return values.join('\n');
+}
+
+function getMergedEditContext(c,caseId){
+  const merge=findMerge(c,caseId);
+  return merge&&merge.case_ids?.[0]===caseId?merge:null;
+}
+
+function splitMergedValueForSave(value,merge){
+  const ids=merge?.case_ids||[];
+  if(ids.length<=1)return [value??''];
+  const raw=(value??'').toString();
+  let parts=[];
+  if(isRichTextValue(raw)){
+    const box=document.createElement('div');
+    box.innerHTML=raw;
+    const blocks=Array.from(box.children);
+    if(blocks.length===ids.length)parts=blocks.map(block=>block.outerHTML);
+    if(parts.length!==ids.length)parts=raw.split(/<br\s*\/?>/i);
+  }else{
+    parts=raw.replace(/\r\n/g,'\n').split('\n');
+  }
+  // 简单的一行对应一条用例时，按原顺序分别保存，取消合并后仍能恢复。
+  // 用户重新编辑成复杂富文本时无法可靠推断行边界，则完整内容留在首行，
+  // 其他成员清空，避免重新渲染时重复拼接。
+  return parts.length===ids.length
+    ? parts
+    : [raw,...Array(ids.length-1).fill('')];
+}
+
+async function saveMergedCellValues(caseId,col,merge,value){
+  const ids=merge?.case_ids||[];
+  const parts=splitMergedValueForSave(value,merge);
+  for(let index=0;index<ids.length;index++){
+    const memberId=ids[index];
+    const memberValue=parts[index]??'';
+    const payload=col.is_system?{[col.key]:memberValue}:{custom_fields:{[col.key]:memberValue}};
+    await api(`/api/cases/${memberId}`,{method:'PUT',body:JSON.stringify(payload)});
+  }
+}
+
 function renderCell(c,tc,pageIds=[],ignoreMerge=false){
+  // 用例编号按标题合并组显示：同一条逻辑用例只显示一个编号，
+  // 但不创建 case_no 合并记录，避免编号数据和展示合并相互影响。
+  if(!ignoreMerge&&c.key==='case_no'){
+    const logicalMerge=findMerge({key:'title'},tc.id);
+    if(logicalMerge){
+      const mergeIds=logicalMerge.case_ids||[];
+      const anchorId=mergeIds[0];
+      const visibleIds=mergeIds.filter(id=>pageIds.includes(id));
+      if(tc.id!==anchorId){
+        return pageIds.includes(anchorId)?'':renderMergedContinuationCell(c,tc);
+      }
+      if(visibleIds.length>1)return renderCellContent(c,tc,visibleIds.length,getCaseColumnValue(tc,c));
+    }
+  }
   const merge=ignoreMerge?null:findMerge(c,tc.id);
   if(merge){
-    const visibleIds=(merge.case_ids||[]).filter(id=>pageIds.includes(id));
-    if(visibleIds.length>1&&visibleIds[0]!==tc.id)return '';
-    if(visibleIds.length>1)return renderCellContent(c,tc,visibleIds.length);
+    const mergeIds=merge.case_ids||[];
+    const anchorId=mergeIds[0];
+    const visibleIds=mergeIds.filter(id=>pageIds.includes(id));
+    if(tc.id!==anchorId){
+      // 合并起始行在上一页或被筛选掉时，仍需输出占位 td，避免整行列数减少。
+      // 起始行在当前页时则由 rowspan 覆盖当前页内的后续成员行。
+      return pageIds.includes(anchorId)?'':renderMergedContinuationCell(c,tc);
+    }
+    if(visibleIds.length>1)return renderCellContent(c,tc,visibleIds.length,getMergedCellValue(c,merge));
   }
   return renderCellContent(c,tc,1);
 }
 
-function renderCellContent(c,tc,rowspan=1){
+function renderCellContent(c,tc,rowspan=1,valueOverride){
   const selected=state.mergeAnchor?.key===c.key&&state.mergeAnchor?.caseId===tc.id;
   if(c.key==='status'){
     const selectAttr=state.mergeMode?` onclick="selectMergeCell(event,'${escapeHtml(c.key)}',${tc.id})"`:'';
     const status=normalizeStatus(tc.status);
     const displayStatus=STATUS_LIST.includes(status)?status:'未执行';
     const statusColor=STATUS_COLORS[displayStatus]||'#606266';
-    return `<td class="${rowspan>1?'merged-cell ':''}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor':''}"${rowspan>1?` rowspan="${rowspan}"`:''}${selectAttr}><select class="status-select status-${escapeHtml(displayStatus)}" style="color:${statusColor}" onchange="updateStatus(${tc.id},this.value,this)">${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${displayStatus===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></td>`;
+    const align=columnTextAlign(c);
+    const readonlyAttr=state.currentUser?.can_write===true?'':' disabled';
+    return `<td class="${rowspan>1?'merged-cell ':''}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor':''}" style="text-align:${align};vertical-align:middle"${rowspan>1?` rowspan="${rowspan}"`:''}${selectAttr}><select class="status-select status-${escapeHtml(displayStatus)}" style="color:${statusColor};text-align:${align}" onchange="updateStatus(${tc.id},this.value,this)"${readonlyAttr}>${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${displayStatus===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></td>`;
   }
-  let val=tc[c.key];if(c.key==='custom_fields'){const custom=tc.custom_fields||{};val=Object.values(custom).join(' ');}
+  let val=valueOverride===undefined?getCaseColumnValue(tc,c):valueOverride;if(c.key==='custom_fields'&&valueOverride===undefined){const custom=tc.custom_fields||{};val=Object.values(custom).join(' ');}
   const isRich=isRichTextValue(val);
   const str=escapeHtml(isRich?richTextPlainText(val):val);
-  const contentHtml=isRich?richTextHtml(val):str.replace(/\n/g,'<br>');
+  const contentHtml=isRich?richTextHtml(val,columnTextAlign(c)):str.replace(/\n/g,'<br>');
   const mergeAttr=rowspan>1?` rowspan="${rowspan}"`:'';
   const mergeClass=rowspan>1?'merged-cell ':'';
   const multiline=c.key==='steps'||c.key==='remark'||c.key==='precondition'||c.key==='expected_result'||!c.is_system;
@@ -441,7 +668,7 @@ function renderCellContent(c,tc,rowspan=1){
   }else if(state.editMode){
     interaction=` onclick="beginCellEdit(this,'${escapeHtml(c.key)}',${tc.id})" ondblclick="startInlineEdit(this,'${escapeHtml(c.key)}',${tc.id})"`;
   }
-  return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="${mergeClass}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor ':''}cell-text ${multiline?'multiline':''} ${c.key==='remark'?'rich-cell':''}"${mergeAttr}${interaction} title="${str}">${contentHtml}</td>`;
+  return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="${mergeClass}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor ':''}cell-text ${multiline?'multiline':''} ${c.key==='remark'?'rich-cell':''}" style="text-align:${columnTextAlign(c)}"${mergeAttr}${interaction} title="${str}">${contentHtml}</td>`;
 }
 
 function toggleMergeMode(mode){
@@ -450,6 +677,8 @@ function toggleMergeMode(mode){
 }
 async function selectMergeCell(event,key,caseId){
   event.stopPropagation();
+  const scope=activeVersionScope();
+  if(!scope){showToast('项目与版本已变化，请重新选择版本','error');return;}
   if(state.mergeMode==='unmerge'){
     const merge=findMerge({key},caseId);if(!merge){showToast('该单元格未合并','error');return;}
     try{await api(`/api/merges/${merge.id}`,{method:'DELETE'});state.mergeAnchor=null;await loadCases();showToast('已取消合并');}catch(err){showToast(err.message,'error');}
@@ -462,7 +691,7 @@ async function selectMergeCell(event,key,caseId){
   const [from,to]=start<end?[start,end]:[end,start];
   if(to-from<1){showToast('至少选择两个连续单元格','error');return;}
   try{
-    await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/merges`,{method:'POST',body:JSON.stringify({column_key:key,case_ids:ids.slice(from,to+1)})});
+    await api(`/api/projects/${scope.projectId}/versions/${scope.versionId}/merges`,{method:'POST',body:JSON.stringify({column_key:key,case_ids:ids.slice(from,to+1)})});
     state.mergeMode=false;state.mergeAnchor=null;await loadCases();showToast('单元格合并成功');
   }catch(err){showToast(err.message,'error');}
 }
@@ -474,8 +703,8 @@ function renderPagination(){
 function changePage(p){const tp=Math.max(1,Math.ceil(state.total/state.pageSize));if(p<1||p>tp)return;state.page=p;loadCases();}
 function changePageSize(s){state.pageSize=parseInt(s);state.page=1;loadCases();}
 
-function isRichTextValue(value){return /<(?:img|br|div|p|s|strike|del)\b/i.test((value??'').toString());}
-function richTextHtml(value){
+function isRichTextValue(value){return /<(?:img|br|div|p|span|s|strike|del)\b/i.test((value??'').toString());}
+function richTextHtml(value,forcedAlign=null){
   const raw=(value??'').toString();
   if(!isRichTextValue(raw))return escapeHtml(raw).replace(/\r?\n/g,'<br>');
   const template=document.createElement('template');
@@ -493,6 +722,17 @@ function richTextHtml(value){
         node.setAttribute('alt',node.getAttribute('alt')||'图片');
       }
     }
+  });
+  // 部分 Excel 富文本会把每一行放在同一个 div 下的多个 span 中，
+  // span 本身是行内元素，直接展示时会把原本的多行挤成一行。
+  template.content.querySelectorAll('div,p').forEach(block=>{
+    const children=Array.from(block.children);
+    const onlySpans=children.length>1
+      &&children.every(node=>node.tagName==='SPAN')
+      &&Array.from(block.childNodes).every(node=>node.nodeType===1
+        ||(node.nodeType===3&&!node.textContent.trim()));
+    if(onlySpans)children.slice(0,-1).forEach(node=>node.after(document.createElement('br')));
+    if(forcedAlign&&['DIV','P'].includes(block.tagName))block.style.textAlign=forcedAlign;
   });
   return template.innerHTML;
 }
@@ -543,8 +783,9 @@ function beginCellEdit(td,key,caseId){
   if(state.inlineEditing?.td===td){td.focus();return;}
   if(state.inlineEditing)void commitInlineCellEdit(state.inlineEditing);
 
-  const oldVal=(tc[key]??'').toString();
-  const editing={td,key,caseId,col,oldVal,originalHtml:td.innerHTML,originalTitle:td.title,finished:false,uploadedImageIds:[]};
+  const merge=getMergedEditContext(col,caseId);
+  const oldVal=(merge?getMergedCellValue(col,merge):getCaseColumnValue(tc,col)).toString();
+  const editing={td,key,caseId,col,merge,oldVal,originalHtml:td.innerHTML,originalTitle:td.title,finished:false,uploadedImageIds:[]};
   state.inlineEditing=editing;
   td.classList.add('cell-editing');
   td.removeAttribute('title');
@@ -566,8 +807,18 @@ function beginCellEdit(td,key,caseId){
     }
   };
   editor.focus();
-  if(typeof editor.select==='function')editor.select();
-  else{const range=document.createRange();range.selectNodeContents(editor);const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);}
+  // 单击进入编辑时只放置普通光标，不自动全选内容。
+  // 这样选中文字工具条只会在用户主动产生选区后显示。
+  if(editor.isContentEditable){
+    const range=document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    const selection=window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }else if(typeof editor.select==='function'){
+    editor.setSelectionRange(editor.value.length,editor.value.length);
+  }
 }
 
 async function commitInlineCellEdit(editing){
@@ -580,8 +831,11 @@ async function commitInlineCellEdit(editing){
   if(state.inlineEditing===editing)state.inlineEditing=null;
   if(value===oldVal){td.title=editing.originalTitle;return;}
   try{
-    const payload=col.is_system?{[key]:value}:{custom_fields:{[key]:value}};
-    await api(`/api/cases/${caseId}`,{method:'PUT',body:JSON.stringify(payload)});
+    if(editing.merge)await saveMergedCellValues(caseId,col,editing.merge,value);
+    else{
+      const payload=col.is_system?{[key]:value}:{custom_fields:{[key]:value}};
+      await api(`/api/cases/${caseId}`,{method:'PUT',body:JSON.stringify(payload)});
+    }
     if(key==='remark')await cleanupRemovedEmbeddedImages(caseId,oldVal,value,editing.uploadedImageIds);
     await loadCases();
   }catch(err){
@@ -613,8 +867,9 @@ function startInlineEdit(td,key,caseId){
   }else if(state.inlineEditing){
     void commitInlineCellEdit(state.inlineEditing);
   }
-  const oldVal=(valueOverride??tc[key]??'').toString();
-  state.editingCell={caseId,key,col,oldVal,uploadedImageIds:[]};
+  const merge=getMergedEditContext(col,caseId);
+  const oldVal=(valueOverride??(merge?getMergedCellValue(col,merge):getCaseColumnValue(tc,col))).toString();
+  state.editingCell={caseId,key,col,merge,oldVal,uploadedImageIds:[]};
   $('#cell-editor-title').textContent=`编辑：${col.name}`;
   setEditorValue($('#cell-editor-input'),oldVal);
   state.caseImages=[];
@@ -629,8 +884,11 @@ async function saveCellEditor(){
   const value=getEditorValue($('#cell-editor-input'));
   if(value===editing.oldVal){closeCellEditor();return;}
   try{
-    const payload=editing.col.is_system?{[editing.key]:value}:{custom_fields:{[editing.key]:value}};
-    await api(`/api/cases/${editing.caseId}`,{method:'PUT',body:JSON.stringify(payload)});
+    if(editing.merge)await saveMergedCellValues(editing.caseId,editing.col,editing.merge,value);
+    else{
+      const payload=editing.col.is_system?{[editing.key]:value}:{custom_fields:{[editing.key]:value}};
+      await api(`/api/cases/${editing.caseId}`,{method:'PUT',body:JSON.stringify(payload)});
+    }
     if(editing.key==='remark')await cleanupRemovedEmbeddedImages(editing.caseId,editing.oldVal,value,editing.uploadedImageIds);
     closeCellEditor(true);await Promise.all([loadCases(),loadStats()]);
   }catch(err){showToast(err.message,'error');}
@@ -675,7 +933,7 @@ function openCaseModal(tc=null){
     }
     return `<div class="form-group full" style="margin-bottom:14px"><label>${escapeHtml(c.name)}</label>${control}</div>`;
   }).join('');
-  body.innerHTML=`<div class="rich-format-toolbar"><button type="button" class="secondary" onmousedown="event.preventDefault()" onclick="toggleStrike()">删除线</button><span>选中文字后点击“删除线”，或按 Ctrl+Shift+X</span></div>${fieldHtml||'<p class="empty-state" style="padding:20px">当前没有可编辑的显示列</p>'}
+  body.innerHTML=`${fieldHtml||'<p class="empty-state" style="padding:20px">当前没有可编辑的显示列</p>'}
     <div class="form-group full"><label>图片附件</label><input type="file" id="case-images" multiple accept="image/*"><button type="button" class="secondary paste-image-btn" onclick="pasteImageFromClipboard()">从剪贴板粘贴图片</button><p style="font-size:12px;color:#909399;margin-top:4px">也可以在输入框中按 Ctrl+V 粘贴；图片会先显示缩略图，保存后上传</p><div class="image-list" id="image-list"></div></div>`;
   state.pendingImages=[];state.pendingEmbeddedImages=[];state.caseImages=[];state.caseModalUploadedImageIds=[];state.caseModalSaving=false;openModal('#case-modal');state.pasteTarget=tc?tc.id:null;
   $('#case-images').addEventListener('change',e=>{addPendingImages(Array.from(e.target.files||[]));e.target.value='';});
@@ -692,6 +950,76 @@ function toggleStrike(){
   document.execCommand('strikeThrough',false,null);
   target.dispatchEvent(new Event('input',{bubbles:true}));
 }
+
+let selectionFormatRange=null;
+
+function getSelectedEditorContext(){
+  if(!state.editMode)return null;
+  const selection=window.getSelection();
+  if(!selection||selection.rangeCount===0||selection.isCollapsed||!selection.toString().trim())return null;
+  const anchor=selection.anchorNode;
+  const focus=selection.focusNode;
+  const anchorElement=anchor?.nodeType===Node.ELEMENT_NODE?anchor:anchor?.parentElement;
+  const target=anchorElement?.closest?.('[contenteditable="true"]');
+  if(!target||!focus||!target.contains(focus))return null;
+  return {selection,target,range:selection.getRangeAt(0)};
+}
+
+function hideSelectionFormatMenu(){
+  const menu=$('#selection-format-menu');
+  if(menu){menu.style.display='none';menu.innerHTML='';}
+  selectionFormatRange=null;
+}
+
+function showSelectionFormatMenu(){
+  const context=getSelectedEditorContext();
+  const menu=$('#selection-format-menu');
+  if(!context||!menu){hideSelectionFormatMenu();return;}
+  selectionFormatRange={target:context.target,range:context.range.cloneRange()};
+  menu.innerHTML='<button type="button" data-format="left">靠左</button><button type="button" data-format="center">居中</button><button type="button" data-format="right">靠右</button><button type="button" data-format="strike">删除线</button>';
+  menu.querySelectorAll('button').forEach(button=>{
+    button.addEventListener('mousedown',e=>e.preventDefault());
+    button.addEventListener('click',()=>applySelectionFormat(button.dataset.format));
+  });
+  const rect=context.range.getBoundingClientRect();
+  menu.style.display='flex';
+  menu.style.visibility='hidden';
+  requestAnimationFrame(()=>{
+    const gap=8;
+    let left=rect.left+(rect.width/2)-(menu.offsetWidth/2);
+    let top=rect.top-menu.offsetHeight-gap;
+    left=Math.max(gap,Math.min(left,window.innerWidth-menu.offsetWidth-gap));
+    if(top<gap)top=Math.min(window.innerHeight-menu.offsetHeight-gap,rect.bottom+gap);
+    menu.style.left=`${Math.max(gap,left)}px`;
+    menu.style.top=`${Math.max(gap,top)}px`;
+    menu.style.visibility='visible';
+  });
+}
+
+function applySelectionFormat(format){
+  const saved=selectionFormatRange;
+  if(!saved||!saved.target?.isConnected){hideSelectionFormatMenu();return;}
+  saved.target.focus();
+  const selection=window.getSelection();selection.removeAllRanges();selection.addRange(saved.range);
+  const command=format==='strike'?'strikeThrough':`justify${format.charAt(0).toUpperCase()}${format.slice(1)}`;
+  document.execCommand(command,false,null);
+  saved.target.dispatchEvent(new Event('input',{bubbles:true}));
+  hideSelectionFormatMenu();
+}
+
+document.addEventListener('selectionchange',()=>{
+  if(window.getSelection()?.isCollapsed)hideSelectionFormatMenu();
+  else showSelectionFormatMenu();
+});
+document.addEventListener('mouseup',()=>setTimeout(showSelectionFormatMenu,0));
+document.addEventListener('keyup',e=>{if(e.shiftKey||e.key==='ArrowLeft'||e.key==='ArrowRight')showSelectionFormatMenu();});
+document.addEventListener('mousedown',e=>{
+  const menu=$('#selection-format-menu');
+  if(menu&&!menu.contains(e.target)){
+    const context=getSelectedEditorContext();
+    if(!context)hideSelectionFormatMenu();
+  }
+});
 
 async function loadCaseImages(caseId){
   const res=await api(`/api/cases/${caseId}/images`);state.caseImages=res.data||[];renderImageList();
@@ -828,6 +1156,7 @@ function addQuickRow(){
   if(!state.currentVersion){showToast('请先选择一个版本','error');return;}
   const count=prompt('要添加多少行？',1);
   if(count===null)return;
+  state.actionsCollapsed=false;
   state.quickInsertCount=Math.max(1,Math.min(99,parseInt(count)||1));
   state.quickInsertTarget={type:'top'};
   state.quickAddRow=true;
@@ -836,10 +1165,28 @@ function addQuickRow(){
 
 function insertQuickRow(caseId,position,count=1){
   if(!state.currentVersion)return;
-  state.quickInsertTarget={type:position,caseId:caseId};
+  state.actionsCollapsed=false;
+  state.quickInsertTarget=getSafeQuickInsertTarget(caseId,position);
   state.quickInsertCount=Math.max(1,Math.min(99,count));
   state.quickAddRow=true;
   renderQuickAddRows();
+}
+
+function getSafeQuickInsertTarget(caseId,position){
+  if(!['above','below'].includes(position))return {type:position,caseId};
+  const targetIndex=state.cases.findIndex(tc=>Number(tc.id)===Number(caseId));
+  if(targetIndex<0)return {type:position,caseId};
+  let boundaryIndex=targetIndex;
+  (state.merges||[]).forEach(merge=>{
+    const memberIndexes=(merge.case_ids||[])
+      .map(id=>state.cases.findIndex(tc=>Number(tc.id)===Number(id)))
+      .filter(index=>index>=0);
+    if(memberIndexes.length<2||!memberIndexes.includes(targetIndex))return;
+    boundaryIndex=position==='above'
+      ?Math.min(boundaryIndex,...memberIndexes)
+      :Math.max(boundaryIndex,...memberIndexes);
+  });
+  return {type:position,caseId:state.cases[boundaryIndex]?.id??caseId};
 }
 
 function insertQuickRowPrompt(caseId,position){
@@ -859,12 +1206,18 @@ function buildQuickInputRow(i,cols){
 }
 
 function renderQuickAddRows(){
+  if(!state.currentVersion){
+    state.quickAddRow=false;
+    renderTable();
+    return;
+  }
   const cols=visibleColumns();
   const thead=$('#case-table thead');
   const tbody=$('#case-table tbody');
   const showSelection=state.editMode;
   const ths=cols.map(c=>`<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${c.width}px"><span class="col-title">${escapeHtml(c.name)}</span></th>`).join('');
-  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"></th>':''}${ths}<th class="actions-header" style="width:132px">操作</th></tr>`;
+  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"></th>':''}${ths}${renderActionsHeader()}</tr>`;
+  bindColumnContextMenu();
   tbody.innerHTML='';
   const count=state.quickInsertCount||1;
   const target=state.quickInsertTarget||{type:'top'};
@@ -877,10 +1230,8 @@ function renderQuickAddRows(){
     const tr=document.createElement('tr');
     tr.dataset.caseId=tc.id;
     tr.addEventListener('contextmenu',showRowContextMenu);
-    // 输入行暂时位于已有合并区域中，不能让旧 rowspan 跨过输入行；保存后
-    // 后端会把目标合并关系扩展到新用例，再由普通表格渲染最终合并效果。
     const selection=showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:'';
-    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds,true)).join('')}<td class="actions-cell">${renderRowActions(tc.id)}</td>`;
+    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds)).join('')}${renderActionsCell(tc.id)}`;
     tbody.appendChild(tr);
   }
 
@@ -938,12 +1289,14 @@ function openColumnModal(){
       <label>
         <input type="checkbox" class="col-vis" data-id="${c.id}" ${c.is_visible?'checked':''}>
       </label>
-      <span class="column-setting-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>
+      ${!c.is_system&&state.editMode
+        ?`<input class="column-name-input" data-id="${c.id}" value="${escapeHtml(c.name)}" maxlength="100" aria-label="自定义列名称">`
+        :`<span class="column-setting-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>`}
       ${c.is_system?'<span class="tag">系统列</span>':'<span class="tag custom-tag">自定义列</span>'}
       ${c.is_system&&c.key==='case_no'?`<button class="secondary reset-column-number-btn" onclick="resetCaseNumbers()">重置编号</button>`:''}
       ${c.is_system&&c.key==='status'?`<button class="secondary reset-column-status-btn" onclick="resetCaseStatus()">重置测试结果</button>`:''}
       ${!c.is_system&&state.editMode?`<select class="convert-system-select" onchange="convertColumnToSystem(${c.id},this.value)"><option value="">转为系统列…</option>${systemOptions}</select>`:''}
-      ${!c.is_system?`<button class="danger" onclick="removeCustomColumn(${c.id})">删除</button>`:''}
+      ${!c.is_system&&state.editMode?`<button class="danger" onclick="removeCustomColumn(${c.id})">删除</button>`:''}
     </div>`).join('');
   bindColumnDrag();
   openModal('#column-modal');
@@ -1004,7 +1357,10 @@ async function saveColumnSettings(){
     const items=$$('.column-setting-item');
     const orders={};
     items.forEach((item,idx)=>{orders[item.dataset.id]=idx;});
-    await api(`/api/projects/${state.currentProject.id}/columns/order`,{method:'POST',body:JSON.stringify({orders})});
+    const nameInputs=Array.from($$('.column-name-input'));
+    if(nameInputs.some(input=>!input.value.trim())){showToast('自定义列名称不能为空','error');return;}
+    await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns/order`,{method:'POST',body:JSON.stringify({orders})});
+    for(const input of nameInputs){await api(`/api/columns/${input.dataset.id}`,{method:'PUT',body:JSON.stringify({name:input.value.trim()})});}
     for(const cb of $$('.col-vis')){
       await api(`/api/columns/${cb.dataset.id}`,{method:'PUT',body:JSON.stringify({is_visible:cb.checked})});
     }
@@ -1014,7 +1370,7 @@ async function saveColumnSettings(){
     showToast('列设置已保存');
   }catch(err){showToast(err.message,'error');}
 }
-async function addCustomColumn(){const name=prompt('列显示名称：');const key=prompt('字段标识（英文，如 expected）：');if(!name||!key)return;try{await api(`/api/projects/${state.currentProject.id}/columns`,{method:'POST',body:JSON.stringify({name,key})});await loadColumns();openColumnModal();renderTable();showToast('自定义列已添加');}catch(err){showToast(err.message,'error');}}
+async function addCustomColumn(){const name=prompt('列显示名称：');const key=prompt('字段标识（英文，如 expected）：');if(!name||!key)return;if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}try{await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`,{method:'POST',body:JSON.stringify({name,key})});await loadColumns();openColumnModal();renderTable();showToast('自定义列已添加');}catch(err){showToast(err.message,'error');}}
 async function removeCustomColumn(id){if(!confirm('删除该列会清空所有用例中对应字段的数据，确定继续？'))return;try{await api(`/api/columns/${id}`,{method:'DELETE'});await loadColumns();openColumnModal();renderTable();showToast('列已删除');}catch(err){showToast(err.message,'error');}}
 
 function openImportModal(){
@@ -1226,6 +1582,10 @@ $('#btn-export-excel').onclick=exportCurrentVersionExcel;
 $('#btn-backup').onclick=backupDb;
 $('#btn-search').onclick=()=>{state.keyword=$('#search-input').value;state.page=1;loadCases();};
 $('#search-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('#btn-search').click();});
+$('#status-filter-trigger').onclick=toggleStatusFilter;
+$$('input[name="status-filter-option"]').forEach(input=>input.addEventListener('change',onStatusFilterChange));
+document.addEventListener('click',e=>{if(!e.target.closest('#status-filter'))$('#status-filter')?.classList.remove('open');});
+updateStatusFilterUI();
 $('#save-case-btn').onclick=saveCase;
 $('#save-column-btn').onclick=saveColumnSettings;
 $('#add-custom-column-btn').onclick=addCustomColumn;
