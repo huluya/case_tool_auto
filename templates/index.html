@@ -150,7 +150,7 @@
       </div>
       <div class="modal-body" id="column-form-body"></div>
       <div class="modal-footer">
-        <button id="add-custom-column-btn" class="success">添加自定义列</button>
+        <button id="add-custom-column-btn" class="success" title="只需输入列名称，字段标识由系统自动生成">添加自定义列</button>
         <button id="restore-default-columns-btn" class="secondary">一键整理（恢复默认排序）</button>
         <button class="secondary" onclick="closeModal('#column-modal')">取消</button>
         <button id="save-column-btn">保存</button>
@@ -168,7 +168,7 @@
       <div class="modal-body">
         <div class="import-dropzone" id="import-dropzone">
           <p>拖拽 Excel 文件到此处，或点击上传</p>
-          <p style="font-size:12px;color:#909399">第一行作为表头自动识别列数；模块、标题、操作步骤、备注等标准字段会自动映射，其余列自动创建为自定义字段。用例编号为空时按顺序自动生成。</p>
+          <p style="font-size:12px;color:#909399">第一行作为表头自动识别列数；模块、标题、操作步骤、备注等标准字段会自动映射，其余列自动创建为自定义字段。导入内容会追加到当前版本底部，用例编号按当前列表顺序自动整理。</p>
         </div>
         <input type="file" id="import-file" accept=".xlsx,.xls" style="display:none">
         <div class="progress-bar"><div class="progress-fill" id="import-progress"></div></div>
@@ -258,6 +258,6 @@
     });
     document.getElementById('lightbox-img').addEventListener('pointerup', () => {lightboxDrag=null;});
   </script>
-  <script src="/static/js/app.js?v=20260829-14"></script>
+  <script src="/static/js/app.js?v=20260902-02"></script>
 </body>
 </html>

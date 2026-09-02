@@ -1,6 +1,8 @@
 let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],cases:[],merges:[],page:1,pageSize:20,total:0,keyword:'',statusFilters:[],editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,sidebarCollapsed:false,quickAddRow:false,actionsCollapsed:false,currentUser:null,quickInsertTarget:null,quickInsertCount:1,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false};
 let draggedVersion=null;
 let versionJustDragged=false;
+let pendingCellClick=null;
+const recentPasteByTarget=new WeakMap();
 const STATUS_LIST=['通过','失败','未执行','阻塞','跳过'];
 const STATUS_COLORS={'通过':'#67c23a','失败':'#f56c6c','未执行':'#909399','阻塞':'#e6a23c','跳过':'#409eff'};
 const STATUS_ALIASES={'pass':'通过','passed':'通过','success':'通过','成功':'通过','fail':'失败','failed':'失败','failure':'失败','not run':'未执行','notrun':'未执行','pending':'未执行','blocked':'阻塞','block':'阻塞','skip':'跳过','skipped':'跳过'};
@@ -417,7 +419,13 @@ function renderTable(){
   thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"><input type="checkbox" id="select-all-cases" title="全选当前页" onchange="toggleAllCases(this.checked)"></th>':''}${ths}${showActions?renderActionsHeader():''}</tr>`;
   bindColumnContextMenu();
   tbody.innerHTML='';
-  if(!state.cases.length){tbody.innerHTML=`<tr><td colspan="${cols.length+(showActions?1:0)+(showSelection?1:0)}" class="empty-state">暂无数据</td></tr>`;return;}
+  if(!state.cases.length){
+    tbody.innerHTML=`<tr><td colspan="${cols.length+(showActions?1:0)+(showSelection?1:0)}" class="empty-state">暂无数据</td></tr>`;
+    // 批量删除最后一页/全部用例后没有复选框可供统计，仍需主动清零按钮文案，
+    // 否则会残留“批量删除（85）”这样的旧数量。
+    updateSelectedCaseCount();
+    return;
+  }
   const pageIds=state.cases.map(tc=>tc.id);
   state.cases.forEach(tc=>{
     const cells=cols.map(c=>renderCell(c,tc,pageIds));
@@ -666,7 +674,7 @@ function renderCellContent(c,tc,rowspan=1,valueOverride){
   if(state.mergeMode){
     interaction=` onclick="selectMergeCell(event,'${escapeHtml(c.key)}',${tc.id})"`;
   }else if(state.editMode){
-    interaction=` onclick="beginCellEdit(this,'${escapeHtml(c.key)}',${tc.id})" ondblclick="startInlineEdit(this,'${escapeHtml(c.key)}',${tc.id})"`;
+    interaction=` onclick="queueCellEdit(this,'${escapeHtml(c.key)}',${tc.id})" ondblclick="openCellEditorFromDoubleClick(event,this,'${escapeHtml(c.key)}',${tc.id})"`;
   }
   return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="${mergeClass}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor ':''}cell-text ${multiline?'multiline':''} ${c.key==='remark'?'rich-cell':''}" style="text-align:${columnTextAlign(c)}"${mergeAttr}${interaction} title="${str}">${contentHtml}</td>`;
 }
@@ -698,7 +706,7 @@ async function selectMergeCell(event,key,caseId){
 
 function renderPagination(){
   const tp=Math.max(1,Math.ceil(state.total/state.pageSize));
-  $('#pagination').innerHTML=`<span>共 ${state.total} 条</span><select onchange="changePageSize(this.value)"><option value="20" ${state.pageSize===20?'selected':''}>20 条/页</option><option value="50" ${state.pageSize===50?'selected':''}>50 条/页</option><option value="100" ${state.pageSize===100?'selected':''}>100 条/页</option></select><button ${state.page<=1?'disabled':''} onclick="changePage(${state.page-1})">上一页</button><span>${state.page} / ${tp}</span><button ${state.page>=tp?'disabled':''} onclick="changePage(${state.page+1})">下一页</button>`;
+  $('#pagination').innerHTML=`<span>共 ${state.total} 条</span><select onchange="changePageSize(this.value)"><option value="20" ${state.pageSize===20?'selected':''}>20 条/页</option><option value="50" ${state.pageSize===50?'selected':''}>50 条/页</option><option value="100" ${state.pageSize===100?'selected':''}>100 条/页</option><option value="200" ${state.pageSize===200?'selected':''}>200 条/页</option><option value="300" ${state.pageSize===300?'selected':''}>300 条/页</option></select><button ${state.page<=1?'disabled':''} onclick="changePage(${state.page-1})">上一页</button><span>${state.page} / ${tp}</span><button ${state.page>=tp?'disabled':''} onclick="changePage(${state.page+1})">下一页</button>`;
 }
 function changePage(p){const tp=Math.max(1,Math.ceil(state.total/state.pageSize));if(p<1||p>tp)return;state.page=p;loadCases();}
 function changePageSize(s){state.pageSize=parseInt(s);state.page=1;loadCases();}
@@ -774,6 +782,34 @@ async function cleanupRemovedEmbeddedImages(caseId,oldValue,newValue,extraIds=[]
 function getEditableCellValue(td){
   const editor=td.querySelector('.inline-cell-editor');
   return editor?getEditorValue(editor):(td.innerText||td.textContent||'').replace(/\r\n/g,'\n');
+}
+
+function clearPendingCellClick(){
+  if(pendingCellClick?.timer)clearTimeout(pendingCellClick.timer);
+  pendingCellClick=null;
+}
+
+// 单击和双击都会先触发 click。稍微延迟单击动作，双击到来时取消单击，
+// 避免“刚进入直接编辑又被双击弹窗/失焦取消”的竞争问题。
+function queueCellEdit(td,key,caseId){
+  if(!state.editMode||state.mergeMode)return;
+  if(pendingCellClick?.td===td)return;
+  clearPendingCellClick();
+  const pending={td,key,caseId,timer:null};
+  pending.timer=setTimeout(()=>{
+    if(pendingCellClick!==pending)return;
+    pendingCellClick=null;
+    beginCellEdit(td,key,caseId);
+  },260);
+  pendingCellClick=pending;
+}
+
+function openCellEditorFromDoubleClick(event,td,key,caseId){
+  if(!state.editMode||state.mergeMode)return;
+  event?.preventDefault();
+  event?.stopPropagation();
+  clearPendingCellClick();
+  startInlineEdit(td,key,caseId);
 }
 
 function beginCellEdit(td,key,caseId){
@@ -1370,7 +1406,26 @@ async function saveColumnSettings(){
     showToast('列设置已保存');
   }catch(err){showToast(err.message,'error');}
 }
-async function addCustomColumn(){const name=prompt('列显示名称：');const key=prompt('字段标识（英文，如 expected）：');if(!name||!key)return;if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}try{await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`,{method:'POST',body:JSON.stringify({name,key})});await loadColumns();openColumnModal();renderTable();showToast('自定义列已添加');}catch(err){showToast(err.message,'error');}}
+function createCustomColumnKey(name){
+  let normalized=(name??'').toString().replace(/[^0-9A-Za-z_]+/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
+  if(!normalized)normalized='column';
+  if(/^\d/.test(normalized))normalized=`column_${normalized}`;
+  const used=new Set((state.columns||[]).map(column=>column.key));
+  const base=`c_${normalized}`;
+  let key=base;let suffix=2;
+  while(used.has(key)){key=`${base}_${suffix}`;suffix+=1;}
+  return key;
+}
+async function addCustomColumn(){
+  const name=prompt('请输入自定义列名称（例如：环境、设备型号）：');
+  if(!name?.trim())return;
+  if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}
+  const key=createCustomColumnKey(name.trim());
+  try{
+    await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`,{method:'POST',body:JSON.stringify({name:name.trim(),key})});
+    await loadColumns();openColumnModal();renderTable();showToast('自定义列已添加');
+  }catch(err){showToast(err.message,'error');}
+}
 async function removeCustomColumn(id){if(!confirm('删除该列会清空所有用例中对应字段的数据，确定继续？'))return;try{await api(`/api/columns/${id}`,{method:'DELETE'});await loadColumns();openColumnModal();renderTable();showToast('列已删除');}catch(err){showToast(err.message,'error');}}
 
 function openImportModal(){
@@ -1424,11 +1479,112 @@ function getPastedImageFiles(event){
 function uniqueImageFiles(files){
   const seen=new Set();
   return files.filter(file=>{
-    const key=[file.type||'',file.size||0,file.lastModified||0,file.name||''].join('|');
+    // 同一次剪贴板事件可能同时从 clipboard.files 和 clipboard.items
+    // 取到同一张图片，但两份 File 的 lastModified/name 可能不同；
+    // 使用内容特征去重，避免一张图被重复插入或上传。
+    const key=[file.type||'',file.size||0,file.name||''].join('|');
     if(seen.has(key))return false;
     seen.add(key);return true;
   });
 }
+
+function isRepeatedImagePaste(target,files,html,plainText){
+  const fileSignature=files.map(file=>[file.type||'',file.size||0,file.name||''].join(':')).sort().join(',');
+  const signature=`${plainText||''}|${(html||'').slice(0,4000)}|${fileSignature}`;
+  const now=Date.now();
+  const previous=recentPasteByTarget.get(target);
+  recentPasteByTarget.set(target,{signature,time:now});
+  // 某些剪贴板驱动会在一次 Ctrl+V 中连续派发两个 paste 事件。
+  // 第二个事件直接拦截，防止同一张图片被再次上传；正常再次粘贴间隔足够长时不受影响。
+  return Boolean(previous&&previous.signature===signature&&now-previous.time<300);
+}
+
+// 粘贴外部网页、Excel 或聊天内容时，只保留用例需要的文字结构。
+// 外部内容中的 style/class/字体标签不再进入数据库，避免出现一堆不可读的 HTML。
+function normalizePastedText(value){
+  return (value??'').toString()
+    .replace(/\r\n?/g,'\n')
+    .replace(/\u00a0/g,' ')
+    .replace(/[ \t]+\n/g,'\n')
+    .replace(/\n{3,}/g,'\n\n');
+}
+
+function normalizePastedHtml(html,plainText=''){
+  const raw=(html??'').toString();
+  if(!raw.trim()){
+    return escapeHtml(normalizePastedText(plainText)).replace(/\n/g,'<br>');
+  }
+  const template=document.createElement('template');
+  template.innerHTML=raw;
+  const blocked=new Set(['SCRIPT','STYLE','META','LINK','TITLE','HEAD','IFRAME','OBJECT','EMBED','NOSCRIPT']);
+  const blockTags=new Set(['ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','DIV','DL','DT','DD','FIELDSET','FIGURE','FOOTER','FORM','H1','H2','H3','H4','H5','H6','HEADER','HR','LI','MAIN','NAV','OL','P','PRE','SECTION','TABLE','TBODY','TD','TFOOT','TH','THEAD','TR','UL']);
+  const output=[];
+  const appendBreak=()=>{
+    while(output.length&&output[output.length-1]==='<br>')output.pop();
+    if(output.length)output.push('<br>');
+  };
+  const appendText=value=>{
+    const text=normalizePastedText(value);
+    // HTML 源码的缩进空白不是用户输入，块标签已经负责换行。
+    if(!text||(!text.trim()&&text.includes('\n')))return;
+    output.push(escapeHtml(text));
+  };
+  const walk=node=>{
+    if(node.nodeType===Node.TEXT_NODE){appendText(node.nodeValue);return;}
+    if(node.nodeType!==Node.ELEMENT_NODE)return;
+    const tag=node.tagName;
+    if(blocked.has(tag))return;
+    const isBlock=blockTags.has(tag);
+    if(isBlock)appendBreak();
+    if(tag==='BR'){
+      appendBreak();
+    }else if(tag==='IMG'){
+      const src=(node.getAttribute('src')||'').trim();
+      // 只有数据库图片可以原样带入，外部图片交给图片粘贴上传流程。
+      const id=Number(node.getAttribute('data-image-id'));
+      if(src.startsWith('/api/images/')&&Number.isInteger(id)&&id>0){
+        output.push(`<img class="rich-content-image" src="${escapeHtml(src)}" alt="图片" data-image-id="${id}">`);
+      }
+    }else if(tag==='S'||tag==='STRIKE'||tag==='DEL'){
+      output.push('<s>');
+      Array.from(node.childNodes).forEach(walk);
+      output.push('</s>');
+    }else{
+      Array.from(node.childNodes).forEach(walk);
+    }
+    if(isBlock)appendBreak();
+  };
+  Array.from(template.content.childNodes).forEach(walk);
+  while(output[0]==='<br>')output.shift();
+  while(output[output.length-1]==='<br>')output.pop();
+  const result=output.join('');
+  // 某些程序只提供纯文本版本，HTML 版本却只有不可用的外部图片。
+  if(!result.replace(/<br>|<s>|<\/s>/g,'').trim()){
+    const text=normalizePastedText(plainText).replace(/^\s*\[图片\]\s*$/,'');
+    return escapeHtml(text).replace(/\n/g,'<br>');
+  }
+  return result;
+}
+
+function insertPastedContentAtCaret(target,html,selectionRange=null){
+  if(!target?.isContentEditable||!html)return false;
+  target.focus();
+  const selection=window.getSelection();selection.removeAllRanges();
+  if(selectionRange&&target.contains(selectionRange.commonAncestorContainer))selection.addRange(selectionRange);
+  else{
+    const range=document.createRange();range.selectNodeContents(target);range.collapse(false);selection.addRange(range);
+  }
+  const range=selection.getRangeAt(0);
+  const fragment=range.createContextualFragment(html);
+  const last=fragment.lastChild;
+  range.deleteContents();range.insertNode(fragment);
+  const caret=document.createRange();
+  if(last){caret.setStartAfter(last);caret.collapse(true);}else{caret.selectNodeContents(target);caret.collapse(false);}
+  selection.removeAllRanges();selection.addRange(caret);
+  target.dispatchEvent(new Event('input',{bubbles:true}));
+  return true;
+}
+
 async function readClipboardHtmlImageFiles(html){
   if(!html)return [];
   const files=[];
@@ -1517,15 +1673,31 @@ function setupPasteHandler(){
     const target=e.target?.closest?.('[contenteditable="true"]')||e.target;
     const inlineEditor=target?.classList?.contains('inline-cell-editor');
     if(!modal.classList.contains('active')&&!cellModal.classList.contains('active')&&!inlineEditor)return;
-    const selectionRange=captureRichSelection(target);
-    let files=getPastedImageFiles(e);
+    // input/textarea 保持浏览器默认粘贴行为；这里只处理富文本编辑器。
+    if(!target?.isContentEditable)return;
+    let selectionRange=captureRichSelection(target);
+    let files=uniqueImageFiles(getPastedImageFiles(e));
     const clipboardTypes=Array.from(e.clipboardData?.types||[]);
     const plainText=e.clipboardData?.getData('text/plain')||'';
     const html=e.clipboardData?.getData('text/html')||'';
     const imagePlaceholder=/^\s*\[图片\]\s*$/.test(plainText);
     const mayContainImage=files.length||imagePlaceholder||clipboardTypes.includes('Files')||clipboardTypes.some(type=>type.startsWith('image/'));
-    if(!mayContainImage)return;
+    if(mayContainImage&&isRepeatedImagePaste(target,files,html,plainText)){
+      e.preventDefault();
+      return;
+    }
+    const normalizedHtml=normalizePastedHtml(html,plainText);
+    // 即使剪贴板里同时带了图片，也先插入清理后的文字，避免原来“整段文字消失”。
+    // [图片] 是系统占位文本，不把它写进用例内容。
+    const hasUsableText=normalizedHtml.replace(/<br>|<s>|<\/s>/g,'').trim()!==''
+      &&!(/^(?:\s*<br>\s*)*\[图片\](?:\s*<br>\s*)*$/i.test(normalizedHtml));
+    if(!mayContainImage&&!hasUsableText)return;
     e.preventDefault();
+    if(hasUsableText){
+      insertPastedContentAtCaret(target,normalizedHtml,selectionRange);
+      selectionRange=captureRichSelection(target);
+    }
+    if(!mayContainImage)return;
     if(!files.length)files=await readClipboardImageFiles();
     if(!files.length)files=await readClipboardHtmlImageFiles(html);
     removeImagePlaceholder(target);

@@ -6,11 +6,15 @@ import shutil
 import subprocess
 import re
 import posixpath
+import logging
+import sys
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 from flask import Flask, request, jsonify, send_file, render_template, session
+from flask.logging import default_handler
 from sqlalchemy import create_engine, text
 from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -37,6 +41,52 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 app.secret_key = config.SECRET_KEY
 
 db.init_app(app)
+
+
+def configure_logging():
+    """同时把应用日志输出到控制台和本地文件。
+
+    PyCharm 对 Flask/Werkzeug 默认的 stderr 日志处理不稳定，尤其是
+    ``debug=True`` 开启重载进程时，访问日志容易看不到。这里为 Flask 和
+    Werkzeug 使用同一组处理器：控制台使用 stdout，文件使用按大小轮转的
+    ``logs/case_manager.log``，避免长期运行时日志文件无限增长。
+    """
+    log_dir = os.path.join(config.BASE_DIR, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    console_handler._case_manager_console = True
+
+    file_handler = RotatingFileHandler(
+        os.path.join(log_dir, 'case_manager.log'),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding='utf-8',
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    file_handler._case_manager_file = True
+
+    # Flask 默认处理器会把日志写到 stderr；移除它，统一交给 stdout 和文件。
+    if default_handler in app.logger.handlers:
+        app.logger.removeHandler(default_handler)
+
+    for logger in (app.logger, logging.getLogger('werkzeug')):
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not any(getattr(h, '_case_manager_console', False) for h in logger.handlers):
+            logger.addHandler(console_handler)
+        if not any(getattr(h, '_case_manager_file', False) for h in logger.handlers):
+            logger.addHandler(file_handler)
+
+
+configure_logging()
 
 
 ROLE_READONLY = 0
@@ -879,7 +929,7 @@ def normalize_merge_insert_target(project_id, version_id, target_id=None,
 def get_cases(project_id, version_id):
     page = request.args.get('page', 1, type=int)
     page_size = request.args.get('page_size', 20, type=int)
-    if page_size not in [20, 50, 100]:
+    if page_size not in [20, 50, 100, 200, 300]:
         page_size = 20
     keyword = (request.args.get('keyword', '') or '').strip()
     status_filter = (request.args.get('status', '') or '').strip()
@@ -1491,36 +1541,32 @@ def inspect_excel_bounds(file_storage):
             # 只按 XML 行块扫描，不让 openpyxl/ElementTree 为数万条格式空行
             # 创建对象。带值单元格一定包含 v、is 或 f 节点；只有样式的空行会被跳过。
             worksheet_bytes = archive.read(sheet_path)
-            row_start = 0
-            while True:
-                row_start = worksheet_bytes.find(b'<row ', row_start)
-                if row_start < 0:
-                    break
-                row_end = worksheet_bytes.find(b'</row>', row_start)
-                if row_end < 0:
-                    break
-                row_number_start = worksheet_bytes.find(b' r="', row_start, row_end)
-                if row_number_start >= 0:
-                    row_number_start += 4
-                    row_number_end = worksheet_bytes.find(b'"', row_number_start, row_end)
-                    row_number = int(worksheet_bytes[row_number_start:row_number_end])
-                    row_body = worksheet_bytes[row_start:row_end]
-                    if (b'<v' in row_body or b'<is' in row_body or b'<f' in row_body):
-                        last_value_row = max(last_value_row, row_number)
-                row_start = row_end + 6
+            # Excel 软件、WPS 以及部分第三方导出库会给 OOXML 标签加命名空间
+            # 前缀，例如 <x:row>、<x:v>、<x:mergeCell>。不能只查找字面量
+            # <row>/<mergeCell>，否则会把整张表误判为只有表头，最终出现
+            # “导入成功但导入 0 条”的结果。
+            xml_prefix = rb'(?:[A-Za-z_][A-Za-z0-9_.-]*:)?'
+            row_open_pattern = re.compile(rb'<' + xml_prefix + rb'row\b[^>]*>')
+            row_close_pattern = re.compile(rb'</' + xml_prefix + rb'row\s*>')
+            value_pattern = re.compile(rb'<' + xml_prefix + rb'(?:v|is|f)\b')
+            row_matches = list(row_open_pattern.finditer(worksheet_bytes))
+            for row_match in row_matches:
+                row_end_match = row_close_pattern.search(worksheet_bytes, row_match.end())
+                if not row_end_match:
+                    continue
+                row_number_match = re.search(rb'\br="(\d+)"', row_match.group(0))
+                if not row_number_match:
+                    continue
+                row_number = int(row_number_match.group(1))
+                row_body = worksheet_bytes[row_match.end():row_end_match.start()]
+                if value_pattern.search(row_body):
+                    last_value_row = max(last_value_row, row_number)
 
-            merge_start = 0
-            while True:
-                merge_start = worksheet_bytes.find(b'<mergeCell ', merge_start)
-                if merge_start < 0:
-                    break
-                ref_start = worksheet_bytes.find(b' ref="', merge_start)
-                if ref_start >= 0:
-                    ref_start += 6
-                    ref_end = worksheet_bytes.find(b'"', ref_start)
-                    if ref_end > ref_start:
-                        merge_refs.append(worksheet_bytes[ref_start:ref_end].decode('utf-8'))
-                merge_start += 11
+            merge_pattern = re.compile(rb'<' + xml_prefix + rb'mergeCell\b[^>]*>')
+            for merge_match in merge_pattern.finditer(worksheet_bytes):
+                ref_match = re.search(rb'\bref="([^"]+)"', merge_match.group(0))
+                if ref_match:
+                    merge_refs.append(ref_match.group(1).decode('utf-8'))
 
             merge_ranges = []
             for reference in merge_refs:
@@ -1840,7 +1886,19 @@ def import_cases(project_id, version_id):
                 continue
             data_rows.append((excel_row_number, values))
 
-        sort_orders = compute_sort_orders(project_id, version_id, count=len(data_rows)) if data_rows else []
+        # 普通导入是追加导入：已有用例保留在原位置，新数据从当前列表末尾继续排列。
+        # 这样同一版本可以分批导入多个 Excel，不会把后续批次插到最前面。
+        existing_cases = TestCase.query.filter_by(
+            project_id=project_id, version_id=version_id
+        ).all()
+        existing_cases.sort(key=_case_display_sort_key)
+        append_target_id = existing_cases[-1].id if existing_cases else None
+        sort_orders = compute_sort_orders(
+            project_id, version_id,
+            target_id=append_target_id,
+            position='below' if append_target_id else None,
+            count=len(data_rows)
+        ) if data_rows else []
         imported_case_ids_by_row = {}
         for row_idx, (excel_row_number, row) in enumerate(data_rows):
             custom_fields = {}
@@ -2040,7 +2098,7 @@ def init_db_command():
     create_database()
     initialize_auth_data()
     migrate_sort_order()
-    print('数据库初始化完成')
+    app.logger.info('数据库初始化完成')
 
 
 def migrate_sort_order():
@@ -2091,7 +2149,7 @@ def migrate_sort_order():
                                  {'sort_order': offset, 'id': row[0]})
             conn.commit()
     except Exception as e:
-        print('sort_order 迁移提示:', e)
+        app.logger.warning('sort_order 迁移提示: %s', e)
     migrate_version_columns()
 
 
@@ -2176,7 +2234,7 @@ def migrate_version_columns():
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
-        print('version_columns 迁移提示:', exc)
+        app.logger.warning('version_columns 迁移提示: %s', exc)
 
 
 if __name__ == '__main__':
@@ -2184,4 +2242,7 @@ if __name__ == '__main__':
         create_database()
         initialize_auth_data()
         migrate_sort_order()
-    app.run(host='0.0.0.0', port=5005, debug=True)
+    app.logger.info('用例管理平台启动，日志文件：%s', os.path.join(config.BASE_DIR, 'logs', 'case_manager.log'))
+    # PyCharm 运行时关闭 Flask 自动重载，避免父子进程分离后访问日志只显示在
+    # 子进程或无法显示在当前控制台；日志仍会实时输出到控制台并写入日志文件。
+    app.run(host='0.0.0.0', port=5005, debug=True, use_reloader=False)
