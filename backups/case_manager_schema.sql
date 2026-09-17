@@ -84,6 +84,7 @@ CREATE TABLE `custom_columns` (
   `width` int DEFAULT NULL,
   `sort_order` int DEFAULT NULL,
   `text_align` varchar(10) NOT NULL DEFAULT 'left',
+  `aggregate_type` varchar(20) NOT NULL DEFAULT '',
   `created_at` datetime DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `project_id` (`project_id`),
@@ -135,6 +136,7 @@ CREATE TABLE `test_cases` (
   `priority` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT '',
   `precondition` text COLLATE utf8mb4_unicode_ci,
   `expected_result` text COLLATE utf8mb4_unicode_ci,
+  `row_height` int NOT NULL DEFAULT '36',
   PRIMARY KEY (`id`),
   KEY `project_id` (`project_id`),
   KEY `version_id` (`version_id`),
@@ -202,6 +204,52 @@ CREATE TABLE `users` (
   UNIQUE KEY `username` (`username`),
   KEY `role_id` (`role_id`),
   CONSTRAINT `users_ibfk_1` FOREIGN KEY (`role_id`) REFERENCES `roles` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `requirements`
+--
+
+DROP TABLE IF EXISTS `requirements`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `requirements` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `project_id` int NOT NULL,
+  `version_id` int NOT NULL,
+  `title` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `record_type` varchar(20) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'text',
+  `content` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `table_data` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `sort_order` int NOT NULL DEFAULT '0',
+  `created_at` datetime DEFAULT NULL,
+  `updated_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `project_id` (`project_id`),
+  KEY `version_id` (`version_id`),
+  CONSTRAINT `requirements_ibfk_1` FOREIGN KEY (`project_id`) REFERENCES `projects` (`id`),
+  CONSTRAINT `requirements_ibfk_2` FOREIGN KEY (`version_id`) REFERENCES `versions` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `requirement_images`
+--
+
+DROP TABLE IF EXISTS `requirement_images`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `requirement_images` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `requirement_id` int NOT NULL,
+  `filename` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `image_data` longblob NOT NULL,
+  `mime_type` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `created_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `requirement_id` (`requirement_id`),
+  CONSTRAINT `requirement_images_ibfk_1` FOREIGN KEY (`requirement_id`) REFERENCES `requirements` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 

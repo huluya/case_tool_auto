@@ -1,4 +1,5 @@
-let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],cases:[],merges:[],page:1,pageSize:20,total:0,keyword:'',statusFilters:[],editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,sidebarCollapsed:false,quickAddRow:false,actionsCollapsed:false,currentUser:null,quickInsertTarget:null,quickInsertCount:1,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false};
+const INITIAL_FORMAT={color:'#303133',fontSize:14,bold:false,italic:false,underline:false,strike:false,textAlign:'left'};
+let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],cases:[],merges:[],page:1,pageSize:100,total:0,keyword:'',statusFilters:[],summaryFieldKey:'remark',summaryShowImages:false,columnTotals:{},columnUnits:{},editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,sidebarCollapsed:false,quickAddRow:false,actionsCollapsed:true,currentUser:null,quickInsertTarget:null,quickInsertCount:1,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false,formatRowCaseId:null,formatPainterStyle:null,formatPainterSource:null,formatToolbarInteraction:false,defaultFormats:{},defaultFormat:{...INITIAL_FORMAT},quickFormatColor:'#f56c6c',casesLoadSerial:0,statsLoadSerial:0,requirements:[],requirementScope:null,editingRequirement:null,requirementCreating:false,requirementPendingFiles:[]};
 let draggedVersion=null;
 let versionJustDragged=false;
 let pendingCellClick=null;
@@ -23,6 +24,20 @@ function updateStatusFilterUI(){
     input.checked=selected.includes(input.value);
   });
 }
+
+function formatScopeKey(){
+  if(!state.currentProject||!state.currentVersion)return null;
+  return `${state.currentProject.id}:${state.currentVersion.id}`;
+}
+
+function activateFormatScope(){
+  const key=formatScopeKey();
+  if(!key){state.defaultFormat={...INITIAL_FORMAT};return state.defaultFormat;}
+  if(!state.defaultFormats[key])state.defaultFormats[key]={...INITIAL_FORMAT};
+  state.defaultFormat=state.defaultFormats[key];
+  return state.defaultFormat;
+}
+
 function toggleStatusFilter(){
   const container=$('#status-filter');
   if(container)container.classList.toggle('open');
@@ -77,6 +92,12 @@ function closeModal(id){
   if(id==='#case-modal'&&!state.caseModalSaving&&state.caseModalUploadedImageIds.length){
     void deleteImageRecords(state.caseModalUploadedImageIds);
     state.caseModalUploadedImageIds=[];
+  }
+  if(id==='#requirement-modal'){
+    state.editingRequirement=null;
+    state.requirementCreating=false;
+    state.requirementPendingFiles=[];
+    state.requirementScope=null;
   }
   $(id).classList.remove('active');
 }
@@ -175,7 +196,7 @@ function renderProjects(){
             selectVersion(v.id,p.id);
           };
           vi.addEventListener('contextmenu',e=>{
-            if(!state.editMode||state.currentUser?.can_manage!==true)return;
+            if(!state.editMode||state.currentUser?.can_write!==true)return;
             e.preventDefault();e.stopPropagation();showVersionContextMenu(e,p.id,v.id);
           });
           if(state.editMode){
@@ -249,20 +270,24 @@ async function selectVersion(id,projectId=null){
   // 版本 ID 在全库唯一，但请求必须同时使用它所属的项目 ID，防止
   // 切换项目过程中残留旧项目状态，生成 /projects/A/versions/B 的错误地址。
   state.currentVersion=versions.find(v=>Number(v.id)===Number(id)&&Number(v.project_id)===Number(targetProjectId));
-  state.page=1;state.statusFilters=[];updateStatusFilterUI();
+  activateFormatScope();
+  state.page=1;state.pageSize=100;state.statusFilters=[];state.summaryFieldKey='remark';state.summaryShowImages=false;state.columnTotals={};state.columnUnits={};state.columns=[];updateStatusFilterUI();
   if(!state.currentVersion)return;
+  renderCurrentVersionName();
   await Promise.all([loadColumns(),loadCases(),loadStats()]);
   renderProjects();
   $('#current-project-name').textContent=project.name;
-  $('#current-version-name').textContent=`${project.name} / ${state.currentVersion.version_name}`;
+  renderCurrentVersionName();
 }
 
 function showVersionContextMenu(event,projectId,versionId){
   removeContextMenu();removeVersionContextMenu();
   const menu=document.createElement('div');menu.id='version-context-menu';menu.className='context-menu';
   menu.style.left=event.pageX+'px';menu.style.top=event.pageY+'px';
-  menu.innerHTML='<div>创建版本副本</div>';
-  menu.firstElementChild.onclick=()=>{menu.remove();createVersionCopy(projectId,versionId);};
+  const canManage=state.currentUser?.can_manage===true;
+  menu.innerHTML=`<div data-action="create-requirement">创建需求记录</div>${canManage?'<div data-action="copy-version">创建版本副本</div>':''}`;
+  menu.querySelector('[data-action="create-requirement"]')?.addEventListener('click',()=>{menu.remove();openRequirementModal(projectId,versionId);});
+  menu.querySelector('[data-action="copy-version"]')?.addEventListener('click',()=>{menu.remove();createVersionCopy(projectId,versionId);});
   document.body.appendChild(menu);
   document.addEventListener('click',removeVersionContextMenu,{once:true});
 }
@@ -280,6 +305,210 @@ async function createVersionCopy(projectId,versionId){
     await loadVersionsForProject(projectId);renderProjects();
     showToast(`版本副本创建成功，共复制 ${res.data?.copied_cases??0} 条用例`);
   }catch(err){showToast(err.message,'error');}
+}
+
+const REQUIREMENT_TYPE_NAMES={memo:'备忘录',text:'文字',table:'表格',image:'图片'};
+
+function requirementDefaultTable(){return [['字段','内容'],['','']];}
+
+async function loadRequirementsForScope(){
+  const scope=state.requirementScope;
+  if(!scope)return;
+  const res=await api(`/api/projects/${scope.projectId}/versions/${scope.versionId}/requirements`);
+  state.requirements=res.data||[];
+}
+
+function requirementTableHtml(rows,editable=false){
+  const data=Array.isArray(rows)&&rows.length?rows:requirementDefaultTable();
+  if(!editable){
+    return `<table class="requirement-display-table"><tbody>${data.map(row=>`<tr>${(row||[]).map(cell=>`<td>${escapeHtml(cell).replace(/\r?\n/g,'<br>')}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  }
+  return `<div class="requirement-table-editor" id="requirement-table-editor"><table><tbody>${data.map((row,rowIndex)=>`<tr>${(row||[]).map((cell,colIndex)=>`<td><input data-row="${rowIndex}" data-col="${colIndex}" value="${escapeHtml(cell)}" placeholder="请输入内容"></td>`).join('')}<td class="requirement-table-row-action"><button type="button" class="danger" onclick="removeRequirementTableRow(${rowIndex})">删除行</button></td></tr>`).join('')}</tbody></table><button type="button" class="secondary" onclick="addRequirementTableRow()">添加行</button></div>`;
+}
+
+// 需求正文是可编辑 HTML。只允许备忘录实际需要的标签，避免把外部页面的脚本、事件属性
+// 或样式直接带进页面；图片只接受本系统接口地址，图片本体仍然保存在 MySQL。
+function sanitizeRequirementHtml(value){
+  const template=document.createElement('template');
+  template.innerHTML=(value??'').toString();
+  const allowed=new Set(['BR','B','STRONG','I','EM','U','S','STRIKE','DEL','P','DIV','SPAN','UL','OL','LI','TABLE','THEAD','TBODY','TFOOT','TR','TH','TD','IMG']);
+  const walker=document.createTreeWalker(template.content,NodeFilter.SHOW_ELEMENT);
+  const elements=[];let node;
+  while(node=walker.nextNode())elements.push(node);
+  elements.forEach(element=>{
+    if(!allowed.has(element.tagName)){
+      const parent=element.parentNode;
+      while(element.firstChild)parent?.insertBefore(element.firstChild,element);
+      element.remove();
+      return;
+    }
+    Array.from(element.attributes).forEach(attribute=>{
+      const keep=attribute.name==='class'&&attribute.value==='rich-content-image'
+        ||attribute.name==='data-requirement-image-id'
+        ||attribute.name==='contenteditable'&&element.tagName==='TD'
+        ||attribute.name==='colspan'||attribute.name==='rowspan';
+      if(!keep)element.removeAttribute(attribute.name);
+    });
+    if(element.tagName==='IMG'){
+      const imageId=Number(element.getAttribute('data-requirement-image-id'));
+      if(!Number.isInteger(imageId)||imageId<=0){element.remove();return;}
+      element.setAttribute('src',`/api/requirement-images/${imageId}/content`);
+      element.setAttribute('alt','图片');
+      element.className='rich-content-image';
+    }
+  });
+  return template.innerHTML;
+}
+
+function requirementTableContentHtml(rows){
+  const data=Array.isArray(rows)&&rows.length?rows:requirementDefaultTable();
+  return `<table class="requirement-memo-table"><tbody>${data.map(row=>`<tr>${(row||[]).map(cell=>`<td>${escapeHtml(cell??'')}</td>`).join('')}</tr>`).join('')}</tbody></table><p><br></p>`;
+}
+
+function requirementImageMarkup(images){
+  return (images||[]).map(image=>`<p><img class="rich-content-image" data-requirement-image-id="${Number(image.id)}" src="${escapeHtml(image.content_url||`/api/requirement-images/${image.id}/content`)}" alt="图片"></p>`).join('');
+}
+
+function requirementContentHtml(record){
+  if(!record)return '';
+  let content=record.content||'';
+  // 兼容改版前的表格/图片记录：第一次编辑时转换成备忘录正文，不丢旧数据。
+  if(!content&&record.record_type==='table')content=requirementTableContentHtml(record.table_data||[]);
+  if(!content&&record.images?.length)content=requirementImageMarkup(record.images);
+  return sanitizeRequirementHtml(content);
+}
+
+function requirementImageIdsFromHtml(html){
+  const template=document.createElement('template');template.innerHTML=html||'';
+  return new Set(Array.from(template.content.querySelectorAll('img[data-requirement-image-id]'))
+    .map(image=>Number(image.dataset.requirementImageId)).filter(id=>Number.isInteger(id)&&id>0));
+}
+
+function collectRequirementTable(){
+  const rows={};
+  $$('#requirement-table-editor input[data-row]').forEach(input=>{
+    const row=Number(input.dataset.row);const col=Number(input.dataset.col);
+    if(!rows[row])rows[row]=[];rows[row][col]=input.value;
+  });
+  return Object.keys(rows).sort((a,b)=>Number(a)-Number(b)).map(key=>rows[key].map(value=>value??''));
+}
+
+function addRequirementTableRow(){
+  const tbody=$('#requirement-table-editor tbody');if(!tbody)return;
+  const width=Math.max(2,tbody.querySelector('tr')?.querySelectorAll('input[data-col]').length||2);
+  const rowIndex=tbody.querySelectorAll('tr').length;
+  const row=document.createElement('tr');
+  row.innerHTML=`${Array.from({length:width},(_,colIndex)=>`<td><input data-row="${rowIndex}" data-col="${colIndex}" value="" placeholder="请输入内容"></td>`).join('')}<td class="requirement-table-row-action"><button type="button" class="danger" onclick="removeRequirementTableRow(${rowIndex})">删除行</button></td>`;
+  tbody.appendChild(row);
+}
+
+function removeRequirementTableRow(index){
+  const tbody=$('#requirement-table-editor tbody');if(!tbody)return;
+  const rows=tbody.querySelectorAll('tr');
+  if(rows.length<=1){showToast('至少保留一行','error');return;}
+  rows[index]?.remove();
+  tbody.querySelectorAll('tr').forEach((row,rowIndex)=>row.querySelectorAll('input[data-col]').forEach((input,colIndex)=>{input.dataset.row=rowIndex;input.dataset.col=colIndex;row.querySelector('button')?.setAttribute('onclick',`removeRequirementTableRow(${rowIndex})`);}));
+}
+
+function renderRequirementList(){
+  const list=$('#requirement-list');if(!list)return;
+  const canWrite=state.currentUser?.can_write===true;
+  if(!state.requirements.length){list.innerHTML='<div class="empty-state requirement-empty">当前版本暂无需求记录</div>';return;}
+  list.innerHTML=state.requirements.map(record=>{
+    const content=requirementContentHtml(record)||'<span class="empty">未填写正文，点击编辑补充</span>';
+    return `<article class="requirement-card"><div class="requirement-card-header"><div><strong>${escapeHtml(record.title)}</strong><span class="requirement-type-badge">${REQUIREMENT_TYPE_NAMES[record.record_type]||'备忘录'}</span></div><span class="requirement-time">${escapeHtml(record.updated_at||record.created_at||'')}</span></div><div class="requirement-card-content requirement-memo-content">${content}</div>${canWrite?`<div class="requirement-card-actions"><button type="button" class="secondary" onclick="editRequirement(${record.id})">编辑正文</button><button type="button" class="danger" onclick="deleteRequirement(${record.id})">删除</button></div>`:''}</article>`;
+  }).join('');
+}
+
+function renderRequirementModal(){
+  const body=$('#requirement-body');if(!body)return;
+  const record=state.editingRequirement;
+  const canWrite=state.currentUser?.can_write===true;
+  body.innerHTML=`<div class="requirement-scope-tip">当前版本：${escapeHtml(state.requirementScope?.versionName||'')}</div>
+    <div class="requirement-toolbar"><strong>需求记录列表</strong>${canWrite?'<button type="button" class="success" onclick="newRequirement()">新建需求记录</button>':''}</div>
+    <div id="requirement-list"></div>
+    ${canWrite&&record?`<div class="requirement-editor"><div class="requirement-editor-heading"><h4>编辑需求正文</h4><span class="editor-tip">正文支持文字、表格和 Ctrl+V 粘贴图片</span></div><label>需求标题<input id="requirement-title-input" value="${escapeHtml(record.title||'')}" placeholder="请输入需求标题"></label><div class="requirement-memo-toolbar"><button type="button" class="secondary" onclick="insertRequirementTable()">插入表格</button><span>表格单元格可直接输入，图片点击可放大</span></div><div id="requirement-content-editor" class="requirement-content-editor rich-editor" contenteditable="true" role="textbox" aria-label="需求正文" data-placeholder="请输入需求正文">${requirementContentHtml(record)}</div></div>`:canWrite&&state.requirementCreating?`<div class="requirement-editor requirement-title-creator"><h4>新建需求记录</h4><span class="editor-tip">先填写标题，创建后进入正文编辑页面，正文可稍后补充。</span><label>需求标题<input id="new-requirement-title-input" placeholder="请输入需求标题（必填）" autofocus></label><button type="button" onclick="createRequirementFromTitle()">进入正文编辑</button></div>`:''}`;
+  const saveButton=$('#save-requirement-btn');if(saveButton)saveButton.style.display=canWrite&&record?'':'none';
+  renderRequirementList();
+}
+
+function newRequirement(){
+  if(!state.requirementScope||state.currentUser?.can_write!==true)return;
+  state.editingRequirement=null;state.requirementCreating=true;renderRequirementModal();
+  $('#new-requirement-title-input')?.focus();
+}
+
+async function createRequirementFromTitle(){
+  if(!state.requirementScope||state.currentUser?.can_write!==true)return;
+  const title=$('#new-requirement-title-input')?.value.trim()||'';
+  if(!title){showToast('需求标题不能为空','error');$('#new-requirement-title-input')?.focus();return;}
+  try{
+    const result=await api(`/api/projects/${state.requirementScope.projectId}/versions/${state.requirementScope.versionId}/requirements`,{method:'POST',body:JSON.stringify({title:title.trim(),record_type:'memo',content:'',table_data:[]})});
+    state.editingRequirement={...result.data,images:(result.data.images||[]).map(image=>({...image}))};
+    state.requirementCreating=false;
+    await loadRequirementsForScope();
+    renderRequirementModal();
+    showToast('需求已创建，请补充正文');
+  }catch(err){showToast(err.message,'error');}
+}
+
+function editRequirement(id){
+  const record=state.requirements.find(item=>Number(item.id)===Number(id));
+  if(!record)return;
+  state.editingRequirement={...record,table_data:(record.table_data||[]).map(row=>Array.isArray(row)?row.slice():[]),images:(record.images||[]).map(image=>({...image}))};
+  state.requirementCreating=false;
+  renderRequirementModal();
+}
+
+async function deleteRequirement(id){
+  if(!confirm('确定删除这条需求记录吗？关联图片也会删除。'))return;
+  try{await api(`/api/requirements/${id}`,{method:'DELETE'});await loadRequirementsForScope();renderRequirementModal();showToast('需求记录已删除');}
+  catch(err){showToast(err.message,'error');}
+}
+
+async function uploadRequirementImages(id,files){
+  if(!files.length)return [];
+  const form=new FormData();files.forEach(file=>form.append('images',file));
+  const response=await fetch(`/api/requirements/${id}/images`,{method:'POST',body:form});
+  const result=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(result.message||'需求图片上传失败');
+  return result.data||[];
+}
+
+async function saveRequirement(){
+  if(!state.requirementScope||state.currentUser?.can_write!==true)return;
+  const title=$('#requirement-title-input')?.value.trim()||'';
+  if(!title){showToast('需求标题不能为空','error');return;}
+  const editor=$('#requirement-content-editor');
+  if(!editor||!state.editingRequirement)return;
+  const content=sanitizeRequirementHtml(editor.innerHTML);
+  const currentImageIds=requirementImageIdsFromHtml(content);
+  const previousImageIds=new Set((state.editingRequirement.images||[]).map(image=>Number(image.id)));
+  const payload={title,record_type:'memo',content,table_data:[]};
+  try{
+    const result=await api(`/api/requirements/${state.editingRequirement.id}`,{method:'PUT',body:JSON.stringify(payload)});
+    for(const imageId of previousImageIds){if(!currentImageIds.has(imageId))await api(`/api/requirement-images/${imageId}`,{method:'DELETE'});}
+    state.editingRequirement=result.data;
+    await loadRequirementsForScope();
+    state.editingRequirement=null;renderRequirementModal();showToast('需求记录保存成功');
+  }catch(err){showToast(err.message,'error');}
+}
+
+function insertRequirementTable(){
+  const editor=$('#requirement-content-editor');if(!editor)return;
+  const table='<table class="requirement-memo-table"><tbody><tr><td> </td><td> </td></tr><tr><td> </td><td> </td></tr></tbody></table><p><br></p>';
+  insertPastedContentAtCaret(editor,table,captureRichSelection(editor));
+}
+
+async function openRequirementModal(projectId=null,versionId=null){
+  const project=state.projects.find(item=>Number(item.id)===Number(projectId??state.currentProject?.id));
+  const versions=state.versions[project?.id]||[];
+  const version=versions.find(item=>Number(item.id)===Number(versionId??state.currentVersion?.id));
+  if(!project||!version){showToast('请先选择有效版本','error');return;}
+  state.requirementScope={projectId:project.id,versionId:version.id,versionName:`${project.name} / ${version.version_name}`};
+  state.editingRequirement=null;state.requirementCreating=false;state.requirementPendingFiles=[];
+  try{await loadRequirementsForScope();renderRequirementModal();openModal('#requirement-modal');}
+  catch(err){showToast(err.message,'error');}
 }
 
 async function createProject(){
@@ -325,7 +554,7 @@ async function editVersion(projectId,versionId){
   try{
     await api(`/api/projects/${projectId}/versions/${versionId}`,{method:'PUT',body:JSON.stringify({version_name:name.trim()})});
     await loadVersionsForProject(projectId);renderProjects();
-    if(state.currentVersion?.id===versionId){state.currentVersion=(state.versions[projectId]||[]).find(v=>v.id===versionId);$('#current-version-name').textContent=`${state.currentProject.name} / ${state.currentVersion.version_name}`;}
+    if(state.currentVersion?.id===versionId){state.currentVersion=(state.versions[projectId]||[]).find(v=>v.id===versionId);renderCurrentVersionName();}
     showToast('版本更新成功');
   }catch(err){showToast(err.message,'error');}
 }
@@ -341,42 +570,114 @@ async function deleteVersion(projectId,versionId){
   }catch(err){showToast(err.message,'error');}
 }
 
+function columnSortCompare(a,b){
+  return (Number(a.sort_order)||0)-(Number(b.sort_order)||0)||(Number(a.id)||0)-(Number(b.id)||0);
+}
+
+function formatAggregateDisplay(key){
+  const value=state.columnTotals[key]??'0';
+  const unit=state.columnUnits[key]||'';
+  return `${value}${unit?` ${unit}`:''}`;
+}
+
+function renderCurrentVersionName(){
+  const target=$('#current-version-name');
+  if(!target)return;
+  if(!state.currentProject||!state.currentVersion){target.textContent='';return;}
+  // 数字求和结果显示在对应列标题中，不拼接到版本标题，避免标题过长。
+  target.textContent=`${state.currentProject.name} / ${state.currentVersion.version_name}`;
+}
+
 async function loadColumns(){
   if(!state.currentProject||!state.currentVersion){state.columns=[];return;}
-  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`);state.columns=(res.data||[]).sort((a,b)=>a.sort_order-b.sort_order);
+  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`);state.columns=(res.data||[]).sort(columnSortCompare);
 }
 function visibleColumns(){return state.columns.filter(c=>c.is_visible);}
 
+function updateAggregateColumnHeaders(){
+  $$('#case-table thead th[data-key]').forEach(th=>{
+    const column=state.columns.find(item=>String(item.key)===String(th.dataset.key));
+    if(!column)return;
+    const name=column.aggregate_type==='sum'
+      ?`${column.name}（${formatAggregateDisplay(column.key)}）`
+      :column.name;
+    const title=th.querySelector('.col-title');
+    if(title)title.textContent=name;
+  });
+}
+
 async function loadCases(){
   if(!state.currentVersion)return;
+  // 重新加载会重建表格 DOM。若当前仍有单击编辑中的输入框，先提交它，
+  // 避免旧输入框被移除后再从空的 td.textContent 读取并覆盖原内容。
+  const activeEdit=state.inlineEditing;
+  if(activeEdit&&!activeEdit.finished&&activeEdit.editor?.isConnected){
+    await commitInlineCellEdit(activeEdit,false);
+  }
+  const loadSerial=++state.casesLoadSerial;
+  const projectId=state.currentProject.id;
+  const versionId=state.currentVersion.id;
   const statusQuery=state.statusFilters.join(',');
-  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/cases?page=${state.page}&page_size=${state.pageSize}&keyword=${encodeURIComponent(state.keyword)}&status=${encodeURIComponent(statusQuery)}`);
+  const res=await api(`/api/projects/${projectId}/versions/${versionId}/cases?page=${state.page}&page_size=${state.pageSize}&keyword=${encodeURIComponent(state.keyword)}&status=${encodeURIComponent(statusQuery)}`);
+  // 状态更新、筛选和刷新可能同时发起请求；只接受最后一次请求，
+  // 防止较早返回的旧筛选结果覆盖当前页面。
+  if(loadSerial!==state.casesLoadSerial||state.currentProject?.id!==projectId||state.currentVersion?.id!==versionId)return;
   state.cases=res.data.cases||[];state.total=res.data.total||0;state.columns=res.data.columns||state.columns;state.merges=res.data.merges||[];renderTable();renderPagination();
 }
 
 async function loadStats(){
   if(!state.currentVersion)return;
-  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/stats`);
+  const loadSerial=++state.statsLoadSerial;
+  const projectId=state.currentProject.id;
+  const versionId=state.currentVersion.id;
+  const res=await api(`/api/projects/${projectId}/versions/${versionId}/stats`);
+  if(loadSerial!==state.statsLoadSerial||state.currentProject?.id!==projectId||state.currentVersion?.id!==versionId)return;
   const {total,stats}=res.data;
-  $('#stats-bar').innerHTML=`<span>共 ${total} 条</span>`+STATUS_LIST.map(s=>`<div class="stat-item"><span class="stat-dot" style="background:${STATUS_COLORS[s]}"></span><span>${s}: ${stats[s].count} (${stats[s].percent}%)</span></div>`).join('');
+  state.columnTotals=Object.fromEntries((res.data.numeric_totals||[]).map(item=>[item.key,item.value]));
+  state.columnUnits=Object.fromEntries((res.data.numeric_totals||[]).map(item=>[item.key,item.unit||'']));
+  renderCurrentVersionName();
+  const numericTotals=state.columns.filter(column=>column.is_visible&&column.aggregate_type==='sum').map(column=>`<div class="stat-item numeric-total"><span class="stat-dot"></span><span>${escapeHtml(column.name)}合计: ${escapeHtml(formatAggregateDisplay(column.key))}</span></div>`).join('');
+  $('#stats-bar').innerHTML=`<span>共 ${total} 条</span>`+STATUS_LIST.map(s=>`<div class="stat-item"><span class="stat-dot" style="background:${STATUS_COLORS[s]}"></span><span>${s}: ${stats[s].count} (${stats[s].percent}%)</span></div>`).join('')+numericTotals;
+  // 统计请求可能早于用例请求返回。这里只更新统计相关内容，
+  // 不重绘用例表，避免旧状态短暂覆盖用户刚选择的新执行结果。
+  updateAggregateColumnHeaders();
   await loadSummary();
+}
+
+async function refreshCurrentVersionCases(){
+  if(!state.currentProject||!state.currentVersion){
+    showToast('请先选择项目版本','error');
+    return;
+  }
+  const button=$('#btn-refresh-cases');
+  if(button)button.disabled=true;
+  try{
+    // 不重置搜索、筛选和分页，只重新读取当前项目当前版本的数据。
+    await Promise.all([loadCases(),loadStats()]);
+    showToast('当前版本用例已刷新');
+  }catch(err){
+    showToast(err.message,'error');
+  }finally{
+    if(button)button.disabled=false;
+  }
 }
 
 async function loadSummary(){
   if(!state.currentVersion)return;
   try{
-    const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/summary`);
+    const fieldKey=state.summaryFieldKey||'remark';
+    const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/summary?field_key=${encodeURIComponent(fieldKey)}`);
     const d=res.data;
+    state.summaryFieldKey=d.summary_field_key||fieldKey;
     const btn=$('#btn-summary');
     btn.disabled=!d.can_summarize;
     btn.dataset.summary=JSON.stringify(d);
   }catch(err){console.error(err);}
 }
 
-function openSummaryModal(){
+function renderSummaryModal(d){
   const btn=$('#btn-summary');
   if(btn.disabled)return;
-  const d=JSON.parse(btn.dataset.summary||'{}');
   const body=$('#summary-body');
   const renderProblems=(title,items)=>`
     <div class="summary-section">
@@ -384,13 +685,25 @@ function openSummaryModal(){
       ${items.length?'<ol>'+items.map(item=>{
         const caseNo=escapeHtml(item.case_no||'未编号');
         const caseTitle=escapeHtml(item.title||'未命名用例');
-        return `<li><span class="summary-case-title">${caseTitle}</span>：${escapeHtml(item.reason||'未填写问题描述')}（${caseNo}）</li>`;
+        const images=state.summaryShowImages?(item.images||[]):[];
+        const imageHtml=images.length?`<div class="summary-images">${images.map(image=>`<img src="${escapeHtml(image.content_url||'')}" alt="图片" title="点击放大" onclick="openLightbox(this.src)">`).join('')}</div>`:'';
+        return `<li><span class="summary-case-title">${caseTitle}</span>：<span class="summary-reason">${escapeHtml(item.reason||'未填写问题描述').replace(/\r?\n/g,'<br>')}</span>（${caseNo}）${imageHtml}</li>`;
       }).join('')+'</ol>':'<p class="empty">无</p>'}
     </div>`;
+  const fields=(d.summary_fields||state.columns||[]).map(field=>`<option value="${escapeHtml(field.key)}" ${field.key===state.summaryFieldKey?'selected':''}>${escapeHtml(field.name)}</option>`).join('');
   body.innerHTML=`
+    <div class="summary-options">
+      <label>总结字段 <select id="summary-field-select">${fields}</select></label>
+      <label class="summary-image-toggle"><input type="checkbox" id="summary-show-images" ${state.summaryShowImages?'checked':''}>显示图片</label>
+      <span class="summary-option-tip">默认不显示图片</span>
+      <button type="button" class="secondary" id="summary-export-html">导出 HTML</button>
+      <button type="button" class="secondary" id="summary-export-image">导出图片</button>
+    </div>
     <div class="summary-cards">
       <div class="summary-card"><div class="summary-num">${d.total}</div><div>总用例</div></div>
-      <div class="summary-card"><div class="summary-num">${d.executed}</div><div>已执行</div></div>
+      <div class="summary-card"><div class="summary-num">${d.completed??d.executed??0}</div><div>完成</div></div>
+      <div class="summary-card completion"><div class="summary-num">${d.completed_percent??0}%</div><div>完成率</div></div>
+      <div class="summary-card"><div class="summary-num">${d.unexecuted||0}</div><div>未执行</div></div>
       <div class="summary-card success"><div class="summary-num">${d.success}</div><div>成功</div></div>
       <div class="summary-card fail"><div class="summary-num">${d.fail}</div><div>失败</div></div>
       <div class="summary-card block"><div class="summary-num">${d.block}</div><div>阻塞</div></div>
@@ -400,7 +713,57 @@ function openSummaryModal(){
     ${renderProblems('阻塞问题',d.block_reasons||[])}
     ${renderProblems('跳过问题',d.skip_reasons||[])}
   `;
+  $('#summary-field-select')?.addEventListener('change',async event=>{
+    state.summaryFieldKey=event.target.value;
+    await loadSummary(state.summaryFieldKey);
+    const next=JSON.parse($('#btn-summary').dataset.summary||'{}');
+    renderSummaryModal(next);
+  });
+  $('#summary-show-images')?.addEventListener('change',event=>{
+    state.summaryShowImages=event.target.checked;
+    renderSummaryModal(d);
+  });
+  $('#summary-export-html')?.addEventListener('click',()=>downloadSummary('html'));
+  $('#summary-export-image')?.addEventListener('click',()=>downloadSummary('png'));
+}
+
+function openSummaryModal(){
+  const btn=$('#btn-summary');
+  if(btn.disabled)return;
+  renderSummaryModal(JSON.parse(btn.dataset.summary||'{}'));
   openModal('#summary-modal');
+}
+
+function bindRowHeightResize(){
+  if(!state.editMode)return;
+  $$('#case-table tbody tr[data-case-id]').forEach(tr=>{
+    const cell=tr.querySelector('td.cell-text')||tr.querySelector('td:not(.select-cell):not(.actions-cell)');
+    if(!cell||cell.querySelector('.row-height-handle'))return;
+    const handle=document.createElement('span');handle.className='row-height-handle';handle.title='拖动调整行高';cell.appendChild(handle);
+    handle.addEventListener('mousedown',event=>{
+      event.preventDefault();event.stopPropagation();
+      const startY=event.clientY;const startHeight=tr.getBoundingClientRect().height;
+      const onMove=moveEvent=>{
+        applyCaseRowHeightStyle(tr,Math.round(startHeight+moveEvent.clientY-startY));
+      };
+      const onUp=async()=>{
+        document.removeEventListener('mousemove',onMove);document.removeEventListener('mouseup',onUp);
+        const height=applyCaseRowHeightStyle(tr,Math.round(tr.getBoundingClientRect().height));
+        const caseId=Number(tr.dataset.caseId);const tc=state.cases.find(item=>Number(item.id)===caseId);if(tc)tc.row_height=height;
+        try{await api(`/api/cases/${caseId}`,{method:'PUT',body:JSON.stringify({row_height:height})});showToast(`行高已调整为 ${height}px`);}
+        catch(err){showToast(err.message,'error');}
+      };
+      document.addEventListener('mousemove',onMove);document.addEventListener('mouseup',onUp,{once:true});
+    });
+  });
+}
+
+function applyCaseRowHeightStyle(tr,height){
+  const normalized=Math.max(24,Math.min(360,Number(height)||36));
+  tr.style.height=`${normalized}px`;
+  // 图片预览高度跟随行高，避免原图把表格行撑成竖屏长图。
+  tr.style.setProperty('--case-image-max-height',`${Math.max(24,normalized-18)}px`);
+  return normalized;
 }
 
 function renderTable(){
@@ -415,7 +778,12 @@ function renderTable(){
     updateSelectedCaseCount();
     return;
   }
-  const ths=cols.map(c=>`<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${c.width}px"><span class="col-title">${escapeHtml(c.name)}</span>${state.editMode?'<div class="resize-handle"></div>':''}</th>`).join('');
+  const ths=cols.map(c=>{
+    const headerName=c.aggregate_type==='sum'
+      ?`${c.name}（${formatAggregateDisplay(c.key)}）`
+      :c.name;
+    return `<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${c.width}px" title="${c.aggregate_type==='sum'?'数字求和列，排序优先级最低':''}"><span class="col-title">${escapeHtml(headerName)}</span>${state.editMode?'<div class="resize-handle"></div>':''}</th>`;
+  }).join('');
   thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"><input type="checkbox" id="select-all-cases" title="全选当前页" onchange="toggleAllCases(this.checked)"></th>':''}${ths}${showActions?renderActionsHeader():''}</tr>`;
   bindColumnContextMenu();
   tbody.innerHTML='';
@@ -431,10 +799,13 @@ function renderTable(){
     const cells=cols.map(c=>renderCell(c,tc,pageIds));
     const tr=document.createElement('tr');
     tr.dataset.caseId=tc.id;
+    applyCaseRowHeightStyle(tr,Number(tc.row_height)||36);
+    tr.addEventListener('mousedown',()=>{state.formatRowCaseId=tc.id;});
     tr.addEventListener('contextmenu',showRowContextMenu);
     tr.innerHTML=`${showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:''}${cells.join('')}${showActions?renderActionsCell(tc.id):''}`;
     tbody.appendChild(tr);
   });
+  bindRowHeightResize();
   if(state.editMode)bindColumnResize();
   updateSelectedCaseCount();
 }
@@ -489,14 +860,21 @@ function showRowContextMenu(e){
   if(!state.editMode)return;
   e.preventDefault();
   const caseId=e.currentTarget.dataset.caseId;
+  // 用例编号列不参与合并。记录实际右键所在的列，避免目标用例的标题、模块等
+  // 其他列处于合并区域时，把“按序号插入”错误地推到合并块末尾。
+  const clickedColumn=e.target.closest('td[data-key]')?.dataset.key||'';
+  const insertColumnKey=clickedColumn==='case_no'?'case_no':'';
+  // 这里只允许传递两个固定值，使用 HTML 属性内的单引号，避免把
+  // JSON.stringify 产生的双引号嵌入 onclick 双引号后截断点击脚本。
+  const insertColumnArg=insertColumnKey==='case_no'?"'case_no'":"''";
   removeContextMenu();
   const menu=document.createElement('div');menu.id='row-context-menu';menu.className='context-menu';
   menu.style.left=e.pageX+'px';menu.style.top=e.pageY+'px';
   menu.innerHTML=`
-    <div onclick="insertQuickRow(${caseId},'above',1);removeContextMenu();">在上方插入行</div>
-    <div onclick="insertQuickRow(${caseId},'below',1);removeContextMenu();">在下方插入行</div>
-    <div onclick="insertQuickRowPrompt(${caseId},'above');removeContextMenu();">在上方插入多行</div>
-    <div onclick="insertQuickRowPrompt(${caseId},'below');removeContextMenu();">在下方插入多行</div>
+    <div onclick="insertQuickRow(${caseId},'above',1,${insertColumnArg});removeContextMenu();">在上方插入行</div>
+    <div onclick="insertQuickRow(${caseId},'below',1,${insertColumnArg});removeContextMenu();">在下方插入行</div>
+    <div onclick="insertQuickRowPrompt(${caseId},'above',${insertColumnArg});removeContextMenu();">在上方插入多行</div>
+    <div onclick="insertQuickRowPrompt(${caseId},'below',${insertColumnArg});removeContextMenu();">在下方插入多行</div>
   `;
   document.body.appendChild(menu);
   document.addEventListener('click',removeContextMenu,{once:true});
@@ -661,7 +1039,7 @@ function renderCellContent(c,tc,rowspan=1,valueOverride){
     const statusColor=STATUS_COLORS[displayStatus]||'#606266';
     const align=columnTextAlign(c);
     const readonlyAttr=state.currentUser?.can_write===true?'':' disabled';
-    return `<td class="${rowspan>1?'merged-cell ':''}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor':''}" style="text-align:${align};vertical-align:middle"${rowspan>1?` rowspan="${rowspan}"`:''}${selectAttr}><select class="status-select status-${escapeHtml(displayStatus)}" style="color:${statusColor};text-align:${align}" onchange="updateStatus(${tc.id},this.value,this)"${readonlyAttr}>${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${displayStatus===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></td>`;
+    return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="${rowspan>1?'merged-cell ':''}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor':''}" style="text-align:${align};vertical-align:middle"${rowspan>1?` rowspan="${rowspan}"`:''}${selectAttr}><select class="status-select status-${escapeHtml(displayStatus)}" style="color:${statusColor};text-align:${align}" onchange="updateStatus(${tc.id},this.value,this)"${readonlyAttr}>${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${displayStatus===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></td>`;
   }
   let val=valueOverride===undefined?getCaseColumnValue(tc,c):valueOverride;if(c.key==='custom_fields'&&valueOverride===undefined){const custom=tc.custom_fields||{};val=Object.values(custom).join(' ');}
   const isRich=isRichTextValue(val);
@@ -704,14 +1082,34 @@ async function selectMergeCell(event,key,caseId){
   }catch(err){showToast(err.message,'error');}
 }
 
+function formatToolbarHtml(){
+  // direction:rtl 时 DOM 第一个控件位于最右侧，因此重置按钮固定放在最前面。
+  return `<div id="editor-format-toolbar" class="editor-format-toolbar" role="toolbar" aria-label="用例格式工具"><button type="button" id="format-reset" title="重置当前版本格式">↺</button><button type="button" id="apply-row-height" title="保存行高">应用</button><label class="format-row-height-control" title="设置当前行或选中行的行高"><span>行高</span><input id="format-row-height" type="number" min="24" max="360" step="1" value="36" aria-label="行高"><span>px</span></label><button type="button" id="format-painter" title="格式刷">🖌</button><button type="button" data-format="right" title="靠右">右</button><button type="button" data-format="center" title="居中">中</button><button type="button" data-format="left" title="靠左">左</button><span class="format-toolbar-divider"></span><button type="button" data-format="strike" title="删除线"><span class="strike-icon">S</span></button><button type="button" data-format="underline" title="下划线"><u>U</u></button><button type="button" data-format="italic" title="斜体"><i>I</i></button><button type="button" data-format="bold" title="加粗"><b>B</b></button><label class="format-size-control" title="字体大小"><span>字号</span><select id="format-font-size" aria-label="字体大小"><option value="12">12</option><option value="14" selected>14</option><option value="16">16</option><option value="18">18</option><option value="20">20</option><option value="24">24</option><option value="28">28</option></select></label><label class="format-color-control" title="字体颜色"><span>字色</span><input id="format-font-color" type="color" value="#303133" aria-label="字体颜色"></label><span class="format-toolbar-label">格式</span></div>`;
+}
+
 function renderPagination(){
   const tp=Math.max(1,Math.ceil(state.total/state.pageSize));
-  $('#pagination').innerHTML=`<span>共 ${state.total} 条</span><select onchange="changePageSize(this.value)"><option value="20" ${state.pageSize===20?'selected':''}>20 条/页</option><option value="50" ${state.pageSize===50?'selected':''}>50 条/页</option><option value="100" ${state.pageSize===100?'selected':''}>100 条/页</option><option value="200" ${state.pageSize===200?'selected':''}>200 条/页</option><option value="300" ${state.pageSize===300?'selected':''}>300 条/页</option></select><button ${state.page<=1?'disabled':''} onclick="changePage(${state.page-1})">上一页</button><span>${state.page} / ${tp}</span><button ${state.page>=tp?'disabled':''} onclick="changePage(${state.page+1})">下一页</button>`;
+  const toolbarHtml=state.editMode&&state.currentVersion?formatToolbarHtml():'';
+  $('#pagination').innerHTML=`${toolbarHtml}<div class="pagination-controls"><span>共 ${state.total} 条</span><select onchange="changePageSize(this.value)"><option value="20" ${state.pageSize===20?'selected':''}>20 条/页</option><option value="50" ${state.pageSize===50?'selected':''}>50 条/页</option><option value="100" ${state.pageSize===100?'selected':''}>100 条/页</option><option value="200" ${state.pageSize===200?'selected':''}>200 条/页</option><option value="300" ${state.pageSize===300?'selected':''}>300 条/页</option></select><button ${state.page<=1?'disabled':''} onclick="changePage(${state.page-1})">上一页</button><span>${state.page} / ${tp}</span><button ${state.page>=tp?'disabled':''} onclick="changePage(${state.page+1})">下一页</button></div>`;
+  bindFormatToolbar();
+  updateEditModeUI();
 }
 function changePage(p){const tp=Math.max(1,Math.ceil(state.total/state.pageSize));if(p<1||p>tp)return;state.page=p;loadCases();}
 function changePageSize(s){state.pageSize=parseInt(s);state.page=1;loadCases();}
 
-function isRichTextValue(value){return /<(?:img|br|div|p|span|s|strike|del)\b/i.test((value??'').toString());}
+function isRichTextValue(value){return /<(?:img|br|div|p|span|s|strike|del|font|b|strong|i|em|u)\b/i.test((value??'').toString());}
+function normalizeRichEditorValue(value){
+  const raw=(value??'').toString();
+  if(!raw.trim())return '';
+  const box=document.createElement('div');
+  box.innerHTML=raw;
+  const hasImage=Boolean(box.querySelector('img'));
+  const text=(box.textContent||'').replace(/\u00a0/g,' ').replace(/\u200b/g,'').trim();
+  // 浏览器在 contenteditable 全选删除后可能留下 <br>、空 span 或空 div，
+  // 这些节点只用于维持光标位置，不能作为实际内容保存。
+  if(!hasImage&&!text)return '';
+  return raw;
+}
 function richTextHtml(value,forcedAlign=null){
   const raw=(value??'').toString();
   if(!isRichTextValue(raw))return escapeHtml(raw).replace(/\r?\n/g,'<br>');
@@ -753,8 +1151,36 @@ function richTextPlainText(value){
 }
 function getEditorValue(editor){
   if(!editor)return '';
-  if(editor.isContentEditable)return editor.innerHTML;
+  if(editor.isContentEditable){
+    const raw=editor.innerHTML;
+    const value=editor.dataset.applyDefaultFormat==='true'&&editor.dataset.defaultFormatDirty==='true'&&raw.trim()
+      ?applyDefaultMarkup(raw)
+      :raw;
+    return normalizeRichEditorValue(value);
+  }
   return (editor.value??'').replace(/\r\n/g,'\n');
+}
+
+function applyDefaultMarkup(value){
+  const defaults=activateFormatScope();
+  if(defaults.color==='#303133'&&defaults.fontSize===14&&!defaults.bold&&!defaults.italic&&!defaults.underline&&!defaults.strike)return value;
+  const box=document.createElement('div');box.innerHTML=value;
+  const wrapper=document.createElement('span');
+  wrapper.style.color=defaults.color;wrapper.style.fontSize=`${defaults.fontSize}px`;
+  if(defaults.bold)wrapper.style.fontWeight='bold';
+  if(defaults.italic)wrapper.style.fontStyle='italic';
+  if(defaults.underline)wrapper.style.textDecoration='underline';
+  if(defaults.strike)wrapper.style.textDecoration='line-through';
+  while(box.firstChild)wrapper.appendChild(box.firstChild);
+  box.appendChild(wrapper);return box.innerHTML;
+}
+
+function applyDefaultFormatToEditor(editor){
+  if(!editor?.isContentEditable)return;
+  const defaults=activateFormatScope();
+  editor.style.color=defaults.color;editor.style.fontSize=`${defaults.fontSize}px`;
+  editor.style.fontWeight=defaults.bold?'bold':'normal';editor.style.fontStyle=defaults.italic?'italic':'normal';
+  editor.style.textDecoration=[defaults.underline?'underline':'',defaults.strike?'line-through':''].filter(Boolean).join(' ')||'none';
 }
 function setEditorValue(editor,value){
   if(!editor)return;
@@ -793,6 +1219,7 @@ function clearPendingCellClick(){
 // 避免“刚进入直接编辑又被双击弹窗/失焦取消”的竞争问题。
 function queueCellEdit(td,key,caseId){
   if(!state.editMode||state.mergeMode)return;
+  state.formatRowCaseId=caseId;
   if(pendingCellClick?.td===td)return;
   clearPendingCellClick();
   const pending={td,key,caseId,timer:null};
@@ -821,7 +1248,7 @@ function beginCellEdit(td,key,caseId){
 
   const merge=getMergedEditContext(col,caseId);
   const oldVal=(merge?getMergedCellValue(col,merge):getCaseColumnValue(tc,col)).toString();
-  const editing={td,key,caseId,col,merge,oldVal,originalHtml:td.innerHTML,originalTitle:td.title,finished:false,uploadedImageIds:[]};
+  const editing={td,key,caseId,col,merge,oldVal,lastValue:oldVal,originalHtml:td.innerHTML,originalTitle:td.title,finished:false,uploadedImageIds:[]};
   state.inlineEditing=editing;
   td.classList.add('cell-editing');
   td.removeAttribute('title');
@@ -829,13 +1256,20 @@ function beginCellEdit(td,key,caseId){
   const richEditor=true;
   const editor=document.createElement(richEditor?'div':(multiline?'textarea':'input'));
   editor.className='inline-cell-editor';
-  if(richEditor){editor.contentEditable='true';editor.classList.add('rich-editor');setEditorValue(editor,oldVal);}
+  if(richEditor){editor.contentEditable='true';editor.classList.add('rich-editor');editor.dataset.applyDefaultFormat='true';setEditorValue(editor,oldVal);applyDefaultFormatToEditor(editor);editor.addEventListener('input',()=>{editing.lastValue=getEditorValue(editor);editor.dataset.defaultFormatDirty='true';});}
   else editor.value=oldVal;
   if(multiline){editor.rows=Math.max(3,Math.min(8,oldVal.split('\n').length+1));}
   td.textContent='';
   td.appendChild(editor);
   editing.editor=editor;
-  editor.onblur=()=>{void commitInlineCellEdit(editing);};
+  editor.onblur=()=>{
+    // 选择分页栏格式工具时，编辑器会短暂失焦；等工具执行完再提交，
+    // 否则会出现“点击字号/颜色后格式还没应用，单元格就先保存”的竞态。
+    setTimeout(()=>{
+      if(document.activeElement?.closest?.('#editor-format-toolbar'))return;
+      void commitInlineCellEdit(editing);
+    },0);
+  };
   editor.onkeydown=e=>{
     if(e.key==='Escape'){e.preventDefault();cancelInlineCellEdit(editing);return;}
     if(e.key==='Enter'&&(!multiline||e.ctrlKey)){
@@ -857,15 +1291,22 @@ function beginCellEdit(td,key,caseId){
   }
 }
 
-async function commitInlineCellEdit(editing){
+async function commitInlineCellEdit(editing,reload=true){
   if(!editing||editing.finished)return;
   editing.finished=true;
   const {td,key,caseId,col,oldVal}=editing;
-  const value=getEditableCellValue(td);
+  // 编辑器可能已因列表刷新而脱离 DOM；此时只能使用 input 事件缓存的
+  // 最后真实值，不能用已清空的 td.textContent 作为待保存内容。
+  const value=editing.editor?.isConnected
+    ? getEditorValue(editing.editor)
+    : (editing.lastValue??oldVal);
   td.classList.remove('cell-editing');
   if(editing.editor){editing.editor.onblur=null;editing.editor.onkeydown=null;}
   if(state.inlineEditing===editing)state.inlineEditing=null;
-  if(value===oldVal){td.title=editing.originalTitle;return;}
+  if(value===oldVal){
+    if(td.isConnected){td.innerHTML=editing.originalHtml;td.title=editing.originalTitle;}
+    return;
+  }
   try{
     if(editing.merge)await saveMergedCellValues(caseId,col,editing.merge,value);
     else{
@@ -873,7 +1314,7 @@ async function commitInlineCellEdit(editing){
       await api(`/api/cases/${caseId}`,{method:'PUT',body:JSON.stringify(payload)});
     }
     if(key==='remark')await cleanupRemovedEmbeddedImages(caseId,oldVal,value,editing.uploadedImageIds);
-    await loadCases();
+    if(reload)await loadCases();
   }catch(err){
     showToast(err.message,'error');
     if(state.inlineEditing===null)renderTable();
@@ -937,11 +1378,28 @@ function closeCellEditor(saved=false){
 
 async function updateStatus(id,status,select){
   status=normalizeStatus(status);
+  const localCase=state.cases.find(item=>Number(item.id)===Number(id));
+  const previousStatus=localCase?.status;
+  // 先更新本地列表，后续任何刷新都应立即使用新状态，避免“未执行”闪回。
+  if(localCase)localCase.status=status;
   if(select){
+    select.value=status;
     select.className=`status-select status-${escapeHtml(status)}`;
     select.style.color=STATUS_COLORS[status]||'#606266';
   }
-  try{await api(`/api/cases/${id}`,{method:'PUT',body:JSON.stringify({status})});await Promise.all([loadCases(),loadStats()]);}catch(err){showToast(err.message,'error');}
+  try{
+    await api(`/api/cases/${id}`,{method:'PUT',body:JSON.stringify({status})});
+    await Promise.all([loadCases(),loadStats()]);
+  }catch(err){
+    if(localCase&&previousStatus!==undefined)localCase.status=previousStatus;
+    if(select){
+      const rollback=normalizeStatus(previousStatus||'未执行');
+      select.value=rollback;
+      select.className=`status-select status-${escapeHtml(rollback)}`;
+      select.style.color=STATUS_COLORS[rollback]||'#606266';
+    }
+    showToast(err.message,'error');
+  }
 }
 
 async function resetCaseNumbers(){
@@ -965,12 +1423,16 @@ function openCaseModal(tc=null){
     if(c.key==='status'){
       control=`<select class="case-form-field" data-key="${escapeHtml(c.key)}">${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${value===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select>`;
     }else{
-      control=`<div class="case-form-field rich-editor" data-key="${escapeHtml(c.key)}" contenteditable="true" role="textbox" data-placeholder="可直接输入；选中文字后可使用删除线">${richTextHtml(value)}</div>`;
+      control=`<div class="case-form-field rich-editor" data-key="${escapeHtml(c.key)}" data-apply-default-format="${tc?'false':'true'}" contenteditable="true" role="textbox" data-placeholder="可直接输入；选中文字后可使用格式工具">${richTextHtml(value)}</div>`;
     }
     return `<div class="form-group full" style="margin-bottom:14px"><label>${escapeHtml(c.name)}</label>${control}</div>`;
   }).join('');
   body.innerHTML=`${fieldHtml||'<p class="empty-state" style="padding:20px">当前没有可编辑的显示列</p>'}
     <div class="form-group full"><label>图片附件</label><input type="file" id="case-images" multiple accept="image/*"><button type="button" class="secondary paste-image-btn" onclick="pasteImageFromClipboard()">从剪贴板粘贴图片</button><p style="font-size:12px;color:#909399;margin-top:4px">也可以在输入框中按 Ctrl+V 粘贴；图片会先显示缩略图，保存后上传</p><div class="image-list" id="image-list"></div></div>`;
+  body.querySelectorAll('.rich-editor').forEach(editor=>{
+    applyDefaultFormatToEditor(editor);
+    editor.addEventListener('input',()=>{editor.dataset.defaultFormatDirty='true';});
+  });
   state.pendingImages=[];state.pendingEmbeddedImages=[];state.caseImages=[];state.caseModalUploadedImageIds=[];state.caseModalSaving=false;openModal('#case-modal');state.pasteTarget=tc?tc.id:null;
   $('#case-images').addEventListener('change',e=>{addPendingImages(Array.from(e.target.files||[]));e.target.value='';});
   if(tc)loadCaseImages(tc.id);else renderImageList();
@@ -1012,10 +1474,22 @@ function showSelectionFormatMenu(){
   const menu=$('#selection-format-menu');
   if(!context||!menu){hideSelectionFormatMenu();return;}
   selectionFormatRange={target:context.target,range:context.range.cloneRange()};
-  menu.innerHTML='<button type="button" data-format="left">靠左</button><button type="button" data-format="center">居中</button><button type="button" data-format="right">靠右</button><button type="button" data-format="strike">删除线</button>';
+  const quickColor=escapeHtml(state.quickFormatColor||'#f56c6c');
+  menu.innerHTML='<button type="button" class="format-icon" data-format="left" title="靠左" aria-label="靠左"><span class="align-icon align-left"><i></i><i></i><i></i></span></button><button type="button" class="format-icon" data-format="center" title="居中" aria-label="居中"><span class="align-icon align-center"><i></i><i></i><i></i></span></button><button type="button" class="format-icon" data-format="right" title="靠右" aria-label="靠右"><span class="align-icon align-right"><i></i><i></i><i></i></span></button><button type="button" class="format-icon" data-format="strike" title="删除线" aria-label="删除线"><span class="strike-icon">S</span></button><button type="button" class="format-icon quick-red-format" data-format="quick-red" title="单击使用颜色，双击选择颜色" aria-label="字体颜色"><span class="color-dot" style="background:${quickColor}"></span></button>';
   menu.querySelectorAll('button').forEach(button=>{
     button.addEventListener('mousedown',e=>e.preventDefault());
-    button.addEventListener('click',()=>applySelectionFormat(button.dataset.format));
+    if(button.dataset.format==='quick-red'){
+      let clickTimer=null;
+      button.addEventListener('click',()=>{
+        clearTimeout(clickTimer);
+        clickTimer=setTimeout(()=>applySelectionFormat('quick-red',state.quickFormatColor||'#f56c6c'),220);
+      });
+      button.addEventListener('dblclick',event=>{
+        event.preventDefault();
+        clearTimeout(clickTimer);
+        openQuickColorPicker();
+      });
+    }else button.addEventListener('click',()=>applySelectionFormat(button.dataset.format));
   });
   const rect=context.range.getBoundingClientRect();
   menu.style.display='flex';
@@ -1032,25 +1506,279 @@ function showSelectionFormatMenu(){
   });
 }
 
-function applySelectionFormat(format){
+function applySelectionFormat(format,value=null){
   const saved=selectionFormatRange;
   if(!saved||!saved.target?.isConnected){hideSelectionFormatMenu();return;}
   saved.target.focus();
   const selection=window.getSelection();selection.removeAllRanges();selection.addRange(saved.range);
-  const command=format==='strike'?'strikeThrough':`justify${format.charAt(0).toUpperCase()}${format.slice(1)}`;
-  document.execCommand(command,false,null);
+  const command=format==='strike'?'strikeThrough':format==='quick-red'?'foreColor':`justify${format.charAt(0).toUpperCase()}${format.slice(1)}`;
+  document.execCommand('styleWithCSS',false,true);
+  if(format==='quick-red')document.execCommand('foreColor',false,value||'#f56c6c');
+  else document.execCommand(command,false,null);
   saved.target.dispatchEvent(new Event('input',{bubbles:true}));
   hideSelectionFormatMenu();
 }
 
+function openQuickColorPicker(){
+  if(!selectionFormatRange)return;
+  const input=document.createElement('input');
+  input.type='color';input.value=state.quickFormatColor||'#f56c6c';
+  input.style.cssText='position:fixed;left:-100px;top:-100px;width:1px;height:1px;opacity:0;';
+  const cleanup=()=>{if(input.isConnected)input.remove();};
+  input.addEventListener('change',()=>{
+    state.quickFormatColor=input.value;
+    applySelectionFormat('quick-red',input.value);
+    cleanup();
+  });
+  input.addEventListener('blur',()=>setTimeout(cleanup,0));
+  document.body.appendChild(input);input.focus();input.click();
+}
+
+function savedFormatSelection(){
+  if(selectionFormatRange?.target?.isConnected&&selectionFormatRange.target.isContentEditable){
+    return {target:selectionFormatRange.target,range:selectionFormatRange.range.cloneRange()};
+  }
+  const context=getSelectedEditorContext();
+  if(!context)return null;
+  selectionFormatRange={target:context.target,range:context.range.cloneRange()};
+  return {target:context.target,range:context.range.cloneRange()};
+}
+
+function restoreFormatSelection(saved){
+  if(!saved?.target?.isConnected)return false;
+  saved.target.focus();
+  const selection=window.getSelection();selection.removeAllRanges();selection.addRange(saved.range);
+  return true;
+}
+
+function selectionElement(saved){
+  if(!saved?.range||!saved.target)return saved?.target;
+  let node=saved.range.startContainer;
+  if(node?.nodeType===Node.ELEMENT_NODE&&node.childNodes[saved.range.startOffset])node=node.childNodes[saved.range.startOffset];
+  let element=node?.nodeType===Node.ELEMENT_NODE?node:node?.parentElement;
+  while(element&&element!==saved.target){
+    if(element.hasAttribute?.('style')||/^(B|STRONG|I|EM|U|S|STRIKE|DEL|FONT)$/.test(element.tagName))return element;
+    element=element.parentElement;
+  }
+  return saved.target;
+}
+
+function setSelectedFontSize(target,range,size){
+  const normalized=`${Math.max(10,Math.min(72,Number.parseInt(size,10)||14))}px`;
+  target.querySelectorAll('font,span').forEach(node=>{
+    try{
+      if(range.intersectsNode(node)&&(/^(xxx-large|xx-large|x-large|large|medium|small|x-small|xx-small)$/i.test(node.style.fontSize)||node.tagName==='FONT')){
+        node.style.fontSize=normalized;node.removeAttribute('size');
+      }
+    }catch(error){/* 节点在选区变化期间被移除时忽略 */}
+  });
+}
+
+function applyInlineRangeStyles(saved,styles){
+  if(!restoreFormatSelection(saved))return false;
+  const selection=window.getSelection();const range=selection.getRangeAt(0);
+  if(range.collapsed)return false;
+  const wrapper=document.createElement('span');
+  Object.entries(styles).forEach(([property,value])=>{if(value)wrapper.style[property]=value;});
+  wrapper.appendChild(range.extractContents());range.insertNode(wrapper);
+  const next=document.createRange();next.selectNodeContents(wrapper);selection.removeAllRanges();selection.addRange(next);
+  return true;
+}
+
+function selectedCaseIds(){
+  return Array.from($$('.case-select:checked')).map(box=>Number(box.value)).filter(Number.isInteger);
+}
+
+function updateDefaultFormatControls(){
+  activateFormatScope();
+  const color=$('#format-font-color');const size=$('#format-font-size');
+  const defaults=state.defaultFormat;
+  if(color)color.value=defaults.color;
+  if(size)size.value=String(defaults.fontSize);
+}
+
+function setDefaultFormat(format,value=null){
+  const defaults=activateFormatScope();
+  if(format==='color')defaults.color=value||'#303133';
+  else if(format==='fontSize')defaults.fontSize=Math.max(10,Math.min(72,Number.parseInt(value,10)||14));
+  else if(format==='bold'||format==='italic'||format==='underline'||format==='strike')defaults[format]=!defaults[format];
+  else if(['left','center','right'].includes(format))defaults.textAlign=format;
+  updateDefaultFormatControls();
+  showToast('已设置为下次输入的默认格式');
+}
+
+function formatWholeValue(value,format,formatValue=null){
+  const box=document.createElement('div');
+  box.innerHTML=isRichTextValue(value)?richTextHtml(value):escapeHtml(value??'').replace(/\r?\n/g,'<br>');
+  if(['left','center','right'].includes(format)){
+    box.style.textAlign=format;
+    return box.innerHTML?`<div style="text-align:${format}">${box.innerHTML}</div>`:'';
+  }
+  const wrapper=document.createElement('span');
+  if(format==='color')wrapper.style.color=formatValue||'#f56c6c';
+  if(format==='fontSize')wrapper.style.fontSize=`${Math.max(10,Math.min(72,Number.parseInt(formatValue,10)||14))}px`;
+  if(format==='bold')wrapper.style.fontWeight='bold';
+  if(format==='italic')wrapper.style.fontStyle='italic';
+  if(format==='underline')wrapper.style.textDecoration='underline';
+  if(format==='strike')wrapper.style.textDecoration='line-through';
+  while(box.firstChild)wrapper.appendChild(box.firstChild);
+  box.appendChild(wrapper);
+  return box.innerHTML;
+}
+
+async function applyFormatToSelectedRows(format,value=null,rowIds=[]){
+  const selected=new Set(rowIds.map(Number));
+  const columns=visibleColumns().filter(col=>col.key!=='case_no'&&col.key!=='status');
+  const jobs=[];
+  state.cases.filter(tc=>selected.has(Number(tc.id))).forEach(tc=>columns.forEach(col=>{
+    const oldValue=getCaseColumnValue(tc,col);
+    if(oldValue===null||oldValue===undefined||String(oldValue)==='')return;
+    const nextValue=formatWholeValue(oldValue,format,value);
+    const payload=col.is_system?{[col.key]:nextValue}:{custom_fields:{[col.key]:nextValue}};
+    jobs.push(api(`/api/cases/${tc.id}`,{method:'PUT',body:JSON.stringify(payload)}));
+  }));
+  if(!jobs.length){showToast('选中行没有可格式化的文字','error');return;}
+  try{await Promise.all(jobs);await loadCases();showToast(`已应用到 ${selected.size} 行`);}
+  catch(err){showToast(err.message,'error');}
+}
+
+async function applyToolbarFormat(format,value=null){
+  const saved=savedFormatSelection();
+  const hasText=Boolean(saved&&!saved.range.collapsed&&saved.target.contains(saved.range.commonAncestorContainer));
+  const rows=selectedCaseIds();
+  if(!hasText){
+    if(rows.length&&['color','fontSize','bold','italic','underline','strike','left','center','right'].includes(format)){
+      await applyFormatToSelectedRows(format,value);
+    }else if(format==='color'||format==='fontSize'||format==='bold'||format==='italic'||format==='underline'||format==='strike'||['left','center','right'].includes(format)){
+      setDefaultFormat(format,value);
+    }
+    state.formatToolbarInteraction=false;
+    return;
+  }
+  if(!restoreFormatSelection(saved)){state.formatToolbarInteraction=false;return;}
+  const selection=window.getSelection();
+  document.execCommand('styleWithCSS',false,true);
+  const commands={bold:'bold',italic:'italic',underline:'underline',strike:'strikeThrough',left:'justifyLeft',center:'justifyCenter',right:'justifyRight'};
+  if(format==='color')applyInlineRangeStyles(saved,{color:value||'#303133'});
+  else if(format==='fontSize')applyInlineRangeStyles(saved,{fontSize:`${Math.max(10,Math.min(72,Number.parseInt(value,10)||14))}px`});
+  else if(commands[format])document.execCommand(commands[format],false,null);
+  if(format==='fontSize'){
+    // 直接写入 px，避免浏览器把字号转换成 xxx-large 等不可逆的相对值。
+  }
+  saved.target.dispatchEvent(new Event('input',{bubbles:true}));
+  state.formatToolbarInteraction=false;
+}
+
+function captureFormatPainter(){
+  const saved=savedFormatSelection();
+  if(!saved){showToast('请先选中一段已有格式的文字','error');return;}
+  const element=selectionElement(saved);
+  const style=getComputedStyle(element||saved.target);
+  state.formatPainterStyle={
+    color:style.color,fontSize:style.fontSize,fontWeight:style.fontWeight,
+    fontStyle:style.fontStyle,textDecoration:style.textDecorationLine||style.textDecoration,
+    textAlign:style.textAlign,
+  };
+  state.formatPainterSource={target:saved.target,range:saved.range.cloneRange()};
+  $('#format-painter')?.classList.add('active');
+  // 格式刷工作时隐藏选中文字快捷工具条，避免两个工具条同时抢占选区。
+  hideSelectionFormatMenu();
+  state.formatToolbarInteraction=false;
+  showToast('格式已复制，请选中文字后点击格式刷');
+}
+
+function applyFormatPainter(){
+  const style=state.formatPainterStyle;
+  const saved=savedFormatSelection();
+  if(!style||!saved||!restoreFormatSelection(saved)){showToast('请先复制格式并选中文字','error');return;}
+  applyInlineRangeStyles(saved,{color:style.color,fontSize:style.fontSize,fontWeight:parseInt(style.fontWeight,10)>=600?'bold':'normal',fontStyle:style.fontStyle==='italic'?'italic':'normal',textDecoration:[/underline/.test(style.textDecoration||'')?'underline':'',/(line-through|strike)/.test(style.textDecoration||'')?'line-through':''].filter(Boolean).join(' ')||'none'});
+  saved.target.dispatchEvent(new Event('input',{bubbles:true}));
+  // 格式刷保持亮起，可连续应用；再次点击格式刷才取消。
+  state.formatToolbarInteraction=false;
+  showToast('格式已应用');
+}
+
+function rangesEqual(first,second){
+  if(!first||!second)return false;
+  return first.startContainer===second.startContainer
+    &&first.startOffset===second.startOffset
+    &&first.endContainer===second.endContainer
+    &&first.endOffset===second.endOffset;
+}
+
+function cancelFormatPainter(){
+  state.formatPainterStyle=null;state.formatPainterSource=null;
+  state.formatToolbarInteraction=false;
+  $('#format-painter')?.classList.remove('active');
+  hideSelectionFormatMenu();
+  showToast('格式刷已取消');
+}
+
+function resetDefaultFormat(){
+  const key=formatScopeKey();
+  const defaults={...INITIAL_FORMAT};
+  if(key)state.defaultFormats[key]=defaults;
+  state.defaultFormat=defaults;
+  cancelFormatPainter();updateDefaultFormatControls();showToast('已恢复初始编辑格式');
+}
+
+async function applyRowHeight(){
+  if(!state.editMode||!state.currentVersion)return;
+  const input=$('#format-row-height');
+  const height=Math.max(24,Math.min(360,parseInt(input?.value,10)||36));
+  if(input)input.value=height;
+  const ids=Array.from($$('.case-select:checked')).map(box=>Number(box.value)).filter(Number.isInteger);
+  const targetIds=ids.length?ids:(state.formatRowCaseId?[Number(state.formatRowCaseId)]:[]);
+  if(!targetIds.length){showToast('请先选中用例行或点击一行','error');return;}
+  try{
+    await Promise.all(targetIds.map(id=>api(`/api/cases/${id}`,{method:'PUT',body:JSON.stringify({row_height:height})})));
+    state.cases.forEach(tc=>{if(targetIds.includes(Number(tc.id)))tc.row_height=height;});
+    targetIds.forEach(id=>{const row=$(`#case-table tbody tr[data-case-id="${id}"]`);if(row)row.style.height=`${height}px`;});
+    showToast(`已保存 ${targetIds.length} 行的行高`);
+  }catch(err){showToast(err.message,'error');}
+}
+
+function bindFormatToolbar(){
+  const toolbar=$('#editor-format-toolbar');
+  if(!toolbar||toolbar.dataset.bound==='1')return;
+  toolbar.dataset.bound='1';
+  // 点击工具栏会让 contenteditable 失焦，先把选区存下来，避免格式命令
+  // 因为浏览器的 selectionchange 事件变成“没有选区”。
+  toolbar.addEventListener('mousedown',e=>{
+    state.formatToolbarInteraction=true;
+    const context=getSelectedEditorContext();
+    if(context)selectionFormatRange={target:context.target,range:context.range.cloneRange()};
+    if(e.target.closest('button'))e.preventDefault();
+  });
+  toolbar.querySelectorAll('button[data-format]').forEach(button=>button.addEventListener('click',()=>applyToolbarFormat(button.dataset.format)));
+  $('#format-font-color')?.addEventListener('change',e=>applyToolbarFormat('color',e.target.value));
+  $('#format-font-size')?.addEventListener('change',e=>applyToolbarFormat('fontSize',e.target.value));
+  $('#format-painter')?.addEventListener('click',()=>state.formatPainterStyle?cancelFormatPainter():captureFormatPainter());
+  $('#format-reset')?.addEventListener('click',resetDefaultFormat);
+  $('#apply-row-height')?.addEventListener('click',applyRowHeight);
+  updateDefaultFormatControls();
+}
+
 document.addEventListener('selectionchange',()=>{
+  if(state.formatToolbarInteraction)return;
+  if(state.formatPainterStyle){hideSelectionFormatMenu();return;}
   if(window.getSelection()?.isCollapsed)hideSelectionFormatMenu();
   else showSelectionFormatMenu();
 });
-document.addEventListener('mouseup',()=>setTimeout(showSelectionFormatMenu,0));
+document.addEventListener('mouseup',()=>setTimeout(()=>{
+  const context=getSelectedEditorContext();
+  if(state.formatPainterStyle&&context&&state.formatPainterSource&&!rangesEqual(context.range,state.formatPainterSource.range)){
+    void applyFormatPainter();
+    hideSelectionFormatMenu();
+    return;
+  }
+  if(state.formatPainterStyle){hideSelectionFormatMenu();return;}
+  showSelectionFormatMenu();
+},0));
 document.addEventListener('keyup',e=>{if(e.shiftKey||e.key==='ArrowLeft'||e.key==='ArrowRight')showSelectionFormatMenu();});
 document.addEventListener('mousedown',e=>{
   const menu=$('#selection-format-menu');
+  if(e.target.closest?.('#editor-format-toolbar'))return;
   if(menu&&!menu.contains(e.target)){
     const context=getSelectedEditorContext();
     if(!context)hideSelectionFormatMenu();
@@ -1098,7 +1826,7 @@ function captureRichSelection(target){
   const range=selection.getRangeAt(0);
   return target.contains(range.commonAncestorContainer)?range.cloneRange():null;
 }
-function insertImageAtCaret(target,src,imageId=null,pendingToken=null,selectionRange=null){
+function insertImageAtCaret(target,src,imageId=null,pendingToken=null,selectionRange=null,imageAttribute='data-image-id'){
   if(!target?.isContentEditable)return false;
   target.focus();
   const selection=window.getSelection();selection.removeAllRanges();
@@ -1106,7 +1834,7 @@ function insertImageAtCaret(target,src,imageId=null,pendingToken=null,selectionR
   else{const range=document.createRange();range.selectNodeContents(target);range.collapse(false);selection.addRange(range);}
   const range=selection.getRangeAt(0);const image=document.createElement('img');
   image.className='rich-content-image';image.src=src;image.alt='图片';
-  if(imageId)image.dataset.imageId=String(imageId);
+  if(imageId)image.setAttribute(imageAttribute,String(imageId));
   if(pendingToken)image.dataset.pendingImage=pendingToken;
   range.deleteContents();range.insertNode(image);range.setStartAfter(image);range.collapse(true);
   selection.removeAllRanges();selection.addRange(range);
@@ -1133,6 +1861,22 @@ async function uploadImageFiles(caseId,files){
   const res=await fetch(`/api/cases/${caseId}/images`,{method:'POST',body:form});
   const data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.message||'图片上传失败');
   return data.data||[];
+}
+async function handlePastedRequirementImages(files,target,selectionRange){
+  const requirementId=state.editingRequirement?.id;
+  const richTarget=target?.isContentEditable?target:target?.closest?.('[contenteditable="true"]');
+  if(!requirementId||!richTarget)return;
+  try{
+    const uploaded=await uploadRequirementImages(requirementId,files);
+    for(const image of uploaded){
+      insertImageAtCaret(richTarget,image.content_url||`/api/requirement-images/${image.id}/content`,image.id,null,selectionRange,'data-requirement-image-id');
+      selectionRange=captureRichSelection(richTarget);
+      const images=state.editingRequirement.images||[];
+      if(!images.some(item=>Number(item.id)===Number(image.id)))images.push(image);
+      state.editingRequirement.images=images;
+    }
+    showToast('图片已粘贴到需求正文');
+  }catch(err){showToast(err.message,'error');}
 }
 async function deleteImage(imageId,caseId){if(!confirm('确定删除该图片？'))return;try{await api(`/api/images/${imageId}`,{method:'DELETE'});await loadCaseImages(caseId);}catch(err){showToast(err.message,'error');}}
 function addCase(){openCaseModal();}
@@ -1199,17 +1943,20 @@ function addQuickRow(){
   renderQuickAddRows();
 }
 
-function insertQuickRow(caseId,position,count=1){
+function insertQuickRow(caseId,position,count=1,columnKey=''){
   if(!state.currentVersion)return;
   state.actionsCollapsed=false;
-  state.quickInsertTarget=getSafeQuickInsertTarget(caseId,position);
+  state.quickInsertTarget=getSafeQuickInsertTarget(caseId,position,columnKey);
   state.quickInsertCount=Math.max(1,Math.min(99,count));
   state.quickAddRow=true;
   renderQuickAddRows();
 }
 
-function getSafeQuickInsertTarget(caseId,position){
+function getSafeQuickInsertTarget(caseId,position,columnKey=''){
   if(!['above','below'].includes(position))return {type:position,caseId};
+  // case_no 是每条真实用例独立的系统列。即使同一行的其他列被合并，
+  // 从序号列插入也必须严格以当前真实行作为锚点。
+  if(columnKey==='case_no')return {type:position,caseId,columnKey};
   const targetIndex=state.cases.findIndex(tc=>Number(tc.id)===Number(caseId));
   if(targetIndex<0)return {type:position,caseId};
   let boundaryIndex=targetIndex;
@@ -1222,13 +1969,13 @@ function getSafeQuickInsertTarget(caseId,position){
       ?Math.min(boundaryIndex,...memberIndexes)
       :Math.max(boundaryIndex,...memberIndexes);
   });
-  return {type:position,caseId:state.cases[boundaryIndex]?.id??caseId};
+  return {type:position,caseId:state.cases[boundaryIndex]?.id??caseId,columnKey};
 }
 
-function insertQuickRowPrompt(caseId,position){
+function insertQuickRowPrompt(caseId,position,columnKey=''){
   const n=prompt('插入行数（1~99）：',1);
   if(n===null)return;
-  insertQuickRow(caseId,position,parseInt(n)||1);
+  insertQuickRow(caseId,position,parseInt(n)||1,columnKey);
 }
 
 function cancelQuickRow(){state.quickAddRow=false;state.quickInsertTarget=null;state.quickInsertCount=1;renderTable();}
@@ -1265,9 +2012,13 @@ function renderQuickAddRows(){
   function appendExistingRow(tc){
     const tr=document.createElement('tr');
     tr.dataset.caseId=tc.id;
+    applyCaseRowHeightStyle(tr,Number(tc.row_height)||36);
+    tr.addEventListener('mousedown',()=>{state.formatRowCaseId=tc.id;});
     tr.addEventListener('contextmenu',showRowContextMenu);
     const selection=showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:'';
-    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds)).join('')}${renderActionsCell(tc.id)}`;
+    // 新增输入行可能位于原合并区域内部。预览阶段禁止 rowspan 跨过输入行，
+    // 否则浏览器会吞掉后续行对应的单元格，表现为数据向前一列错位。
+    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds,true)).join('')}${renderActionsCell(tc.id)}`;
     tbody.appendChild(tr);
   }
 
@@ -1283,6 +2034,7 @@ function renderQuickAddRows(){
   }else{
     for(let i=0;i<count;i++)appendInputRow(i);
   }
+  bindRowHeightResize();
 }
 
 async function saveQuickRows(){
@@ -1305,7 +2057,8 @@ async function saveQuickRows(){
         version_id:state.currentVersion.id,
         cases:payloads,
         insert_target:target.caseId||null,
-        insert_position:target.type==='top'?null:target.type
+        insert_position:target.type==='top'?null:target.type,
+        insert_column_key:target.columnKey||null
       })
     });
     state.quickAddRow=false;state.quickInsertTarget=null;state.quickInsertCount=1;
@@ -1328,7 +2081,7 @@ function openColumnModal(){
       ${!c.is_system&&state.editMode
         ?`<input class="column-name-input" data-id="${c.id}" value="${escapeHtml(c.name)}" maxlength="100" aria-label="自定义列名称">`
         :`<span class="column-setting-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>`}
-      ${c.is_system?'<span class="tag">系统列</span>':'<span class="tag custom-tag">自定义列</span>'}
+      ${c.is_system?'<span class="tag">系统列</span>':`<span class="tag custom-tag">${c.aggregate_type==='sum'?'数字求和列':'自定义列'}</span>`}
       ${c.is_system&&c.key==='case_no'?`<button class="secondary reset-column-number-btn" onclick="resetCaseNumbers()">重置编号</button>`:''}
       ${c.is_system&&c.key==='status'?`<button class="secondary reset-column-status-btn" onclick="resetCaseStatus()">重置测试结果</button>`:''}
       ${!c.is_system&&state.editMode?`<select class="convert-system-select" onchange="convertColumnToSystem(${c.id},this.value)"><option value="">转为系统列…</option>${systemOptions}</select>`:''}
@@ -1426,6 +2179,16 @@ async function addCustomColumn(){
     await loadColumns();openColumnModal();renderTable();showToast('自定义列已添加');
   }catch(err){showToast(err.message,'error');}
 }
+async function addSumColumn(){
+  const name=prompt('请输入数字求和列名称（例如：里程）：');
+  if(!name?.trim())return;
+  if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}
+  const key=createCustomColumnKey(name.trim());
+  try{
+    await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`,{method:'POST',body:JSON.stringify({name:name.trim(),key,aggregate_type:'sum'})});
+    await loadColumns();await loadStats();openColumnModal();renderTable();showToast(`数字求和列“${name.trim()}”已添加`);
+  }catch(err){showToast(err.message,'error');}
+}
 async function removeCustomColumn(id){if(!confirm('删除该列会清空所有用例中对应字段的数据，确定继续？'))return;try{await api(`/api/columns/${id}`,{method:'DELETE'});await loadColumns();openColumnModal();renderTable();showToast('列已删除');}catch(err){showToast(err.message,'error');}}
 
 function openImportModal(){
@@ -1459,6 +2222,26 @@ async function exportCurrentVersionExcel(){
     const link=document.createElement('a');link.href=objectUrl;link.download=`${state.currentProject.name}_${state.currentVersion.version_name}_用例.xlsx`;
     document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(objectUrl);
     showToast('Excel 下载成功');
+  }catch(err){showToast(err.message,'error');}
+}
+
+async function downloadSummary(format){
+  if(!state.currentProject||!state.currentVersion)return;
+  const params=new URLSearchParams({
+    format,
+    field_key:state.summaryFieldKey||'remark',
+    show_images:state.summaryShowImages?'1':'0',
+  });
+  try{
+    showToast(`正在生成总结${format==='html'?' HTML':'图片'}，请稍候`);
+    const res=await fetch(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/summary/export?${params}`);
+    if(!res.ok){const data=await res.json().catch(()=>({}));throw new Error(data.message||`导出失败 ${res.status}`);}
+    const blob=await res.blob();
+    const objectUrl=URL.createObjectURL(blob);
+    const link=document.createElement('a');link.href=objectUrl;
+    link.download=`${state.currentProject.name}_${state.currentVersion.version_name}_执行总结.${format}`;
+    document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(objectUrl);
+    showToast('总结导出成功');
   }catch(err){showToast(err.message,'error');}
 }
 
@@ -1670,9 +2453,11 @@ function setupPasteHandler(){
   document.addEventListener('paste',async e=>{
     const modal=$('#case-modal');
     const cellModal=$('#cell-editor-modal');
+    const requirementModal=$('#requirement-modal');
     const target=e.target?.closest?.('[contenteditable="true"]')||e.target;
     const inlineEditor=target?.classList?.contains('inline-cell-editor');
-    if(!modal.classList.contains('active')&&!cellModal.classList.contains('active')&&!inlineEditor)return;
+    const requirementEditor=target?.id==='requirement-content-editor';
+    if(!modal.classList.contains('active')&&!cellModal.classList.contains('active')&&!requirementEditor&&!inlineEditor)return;
     // input/textarea 保持浏览器默认粘贴行为；这里只处理富文本编辑器。
     if(!target?.isContentEditable)return;
     let selectionRange=captureRichSelection(target);
@@ -1701,7 +2486,11 @@ function setupPasteHandler(){
     if(!files.length)files=await readClipboardImageFiles();
     if(!files.length)files=await readClipboardHtmlImageFiles(html);
     removeImagePlaceholder(target);
-    await handlePastedImages(files,target,selectionRange);
+    if(requirementEditor){
+      await handlePastedRequirementImages(files,target,selectionRange);
+    }else{
+      await handlePastedImages(files,target,selectionRange);
+    }
   },true);
 }
 setupPasteHandler();
@@ -1761,18 +2550,36 @@ updateStatusFilterUI();
 $('#save-case-btn').onclick=saveCase;
 $('#save-column-btn').onclick=saveColumnSettings;
 $('#add-custom-column-btn').onclick=addCustomColumn;
+$('#add-sum-column-btn').onclick=addSumColumn;
 $('#restore-default-columns-btn').onclick=restoreDefaultColumnOrder;
-$('#edit-mode-toggle').addEventListener('change',e=>{state.editMode=e.target.checked;updateEditModeUI();renderProjects();renderTable();});
+$('#edit-mode-toggle').addEventListener('change',async e=>{
+  // 切换开关会触发当前编辑器失焦。如果先重绘表格，编辑器节点会被移除，
+  // 删除内容等最后一次修改就无法提交；先完成当前单元格保存，再切换界面。
+  clearPendingCellClick();
+  if(state.inlineEditing)await commitInlineCellEdit(state.inlineEditing);
+  state.editMode=e.target.checked;
+  if(state.editMode)state.actionsCollapsed=true;
+  renderProjects();renderTable();renderPagination();
+});
 $('#btn-toggle-sidebar').onclick=()=>{state.sidebarCollapsed=!state.sidebarCollapsed;$('#sidebar').classList.toggle('collapsed',state.sidebarCollapsed);};
 $('#btn-add-version').onclick=createVersion;
+$('#btn-refresh-cases').onclick=refreshCurrentVersionCases;
+$('#btn-requirements').onclick=()=>openRequirementModal();
 $('#btn-quick-add').onclick=addQuickRow;
 $('#btn-summary').onclick=openSummaryModal;
 $('#btn-merge-cells').onclick=()=>toggleMergeMode('merge');
 $('#btn-unmerge-cells').onclick=()=>toggleMergeMode('unmerge');
 $('#btn-batch-delete').onclick=deleteSelectedCases;
+$('#save-requirement-btn').onclick=saveRequirement;
 function updateEditModeUI(){
   const button=$('#btn-batch-delete');
   if(button)button.style.display=state.editMode?'inline-flex':'none';
+  const formatToolbar=$('#editor-format-toolbar');
+  if(formatToolbar){
+    const visible=state.editMode&&Boolean(state.currentVersion);
+    formatToolbar.classList.toggle('visible',visible);
+    formatToolbar.querySelectorAll('button,input,select').forEach(control=>{control.disabled=!visible;});
+  }
 }
 updateEditModeUI();
 $('#cell-editor-input').addEventListener('keydown',e=>{

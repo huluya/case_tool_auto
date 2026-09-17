@@ -79,6 +79,7 @@ class Version(db.Model):
     cases = db.relationship('TestCase', backref='version', lazy=True, cascade='all, delete-orphan')
     merges = db.relationship('CaseMerge', backref='version', lazy=True, cascade='all, delete-orphan')
     columns = db.relationship('CustomColumn', backref='version', lazy=True, cascade='all, delete-orphan')
+    requirements = db.relationship('Requirement', backref='version', lazy=True, cascade='all, delete-orphan')
 
     def to_dict(self):
         return {
@@ -103,6 +104,7 @@ class CustomColumn(db.Model):
     width = db.Column(db.Integer, default=120)              # 列宽 px
     sort_order = db.Column(db.Integer, default=0)           # 排序
     text_align = db.Column(db.String(10), nullable=False, default='left')  # left/center/right
+    aggregate_type = db.Column(db.String(20), nullable=False, default='')  # '' 或 sum：数字求和列
     created_at = db.Column(db.DateTime, default=datetime.now)
 
     def to_dict(self):
@@ -117,6 +119,7 @@ class CustomColumn(db.Model):
             'width': self.width,
             'sort_order': self.sort_order,
             'text_align': self.text_align or 'left',
+            'aggregate_type': self.aggregate_type or '',
         }
 
 
@@ -136,6 +139,8 @@ class TestCase(db.Model):
     remark = db.Column(db.Text, default='')
     custom_fields = db.Column(db.Text, default='{}')         # JSON 存储自定义列数据
     sort_order = db.Column(db.Integer, default=0)            # 行排序
+    # 每条用例独立保存表格行高（像素），避免刷新或切换版本后丢失排版。
+    row_height = db.Column(db.Integer, nullable=False, default=36)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -164,6 +169,7 @@ class TestCase(db.Model):
             'priority': self.priority,
             'status': self.status,
             'remark': self.remark,
+            'row_height': self.row_height or 36,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
         }
@@ -176,6 +182,69 @@ class TestCase(db.Model):
                 if not col['is_system'] and col['key'] not in data:
                     data[col['key']] = custom.get(col['key'], '')
         return data
+
+
+class Requirement(db.Model):
+    """版本下独立的需求记录，不参与用例列、执行结果和用例编号逻辑。"""
+    __tablename__ = 'requirements'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
+    version_id = db.Column(db.Integer, db.ForeignKey('versions.id'), nullable=False)
+    title = db.Column(db.String(255), nullable=False, default='')
+    record_type = db.Column(db.String(20), nullable=False, default='memo')  # memo/text/table/image
+    content = db.Column(db.Text, nullable=False, default='')
+    table_data = db.Column(db.Text, nullable=False, default='[]')
+    sort_order = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    images = db.relationship('RequirementImage', backref='requirement', lazy=True, cascade='all, delete-orphan')
+
+    def get_table_data(self):
+        try:
+            value = json.loads(self.table_data or '[]')
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    def set_table_data(self, value):
+        self.table_data = json.dumps(value if isinstance(value, list) else [], ensure_ascii=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'project_id': self.project_id,
+            'version_id': self.version_id,
+            'title': self.title,
+            'record_type': self.record_type or 'text',
+            'content': self.content or '',
+            'table_data': self.get_table_data(),
+            'sort_order': self.sort_order,
+            'images': [image.to_dict() for image in self.images],
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
+
+class RequirementImage(db.Model):
+    """需求记录图片，图片本体继续存 MySQL，不落地 uploads 文件夹。"""
+    __tablename__ = 'requirement_images'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    requirement_id = db.Column(db.Integer, db.ForeignKey('requirements.id'), nullable=False)
+    filename = db.Column(db.String(255), nullable=False, default='')
+    image_data = db.Column(LONGBLOB, nullable=False)
+    mime_type = db.Column(db.String(100), nullable=False, default='application/octet-stream')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'requirement_id': self.requirement_id,
+            'filename': self.filename,
+            'mime_type': self.mime_type or 'application/octet-stream',
+            'content_url': f'/api/requirement-images/{self.id}/content',
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+        }
 
 
 class CaseMerge(db.Model):

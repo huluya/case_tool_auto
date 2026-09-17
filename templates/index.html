@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>用例管理平台</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=20260829-21">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260908-02">
 </head>
 <body>
   <!-- 登录页 -->
@@ -57,6 +57,8 @@
             <button id="btn-toggle-sidebar" class="secondary" title="收起/展开项目列表">☰</button>
             <span id="current-version-name" style="font-weight:600;color:#303133"></span>
             <button id="btn-add-version">新建版本</button>
+            <button id="btn-refresh-cases" class="secondary" title="仅刷新当前版本的用例">刷新用例</button>
+            <button id="btn-requirements" class="secondary" title="查看当前版本需求记录">需求记录</button>
           </div>
           <div class="toolbar-right">
             <div class="toolbar-search-box">
@@ -100,7 +102,6 @@
     </div>
   </div>
 
-  <!-- 选中文字后显示的编辑工具条；没有选中文本时保持隐藏 -->
   <div id="selection-format-menu" class="selection-format-menu" role="toolbar" aria-label="文本对齐工具"></div>
 
   <!-- 用例弹窗 -->
@@ -114,6 +115,21 @@
       <div class="modal-footer">
         <button class="secondary" onclick="closeModal('#case-modal')">取消</button>
         <button id="save-case-btn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 版本需求记录弹窗：独立于用例表格，支持文字、表格和图片记录 -->
+  <div class="modal-overlay" id="requirement-modal">
+    <div class="modal requirement-modal">
+      <div class="modal-header">
+        <h3 id="requirement-modal-title">版本需求记录</h3>
+        <button class="close-btn" onclick="closeModal('#requirement-modal')">&times;</button>
+      </div>
+      <div class="modal-body" id="requirement-body"></div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="closeModal('#requirement-modal')">关闭</button>
+        <button id="save-requirement-btn">保存需求记录</button>
       </div>
     </div>
   </div>
@@ -151,6 +167,7 @@
       <div class="modal-body" id="column-form-body"></div>
       <div class="modal-footer">
         <button id="add-custom-column-btn" class="success" title="只需输入列名称，字段标识由系统自动生成">添加自定义列</button>
+        <button id="add-sum-column-btn" class="success" title="创建一个支持小数并自动求和的数字列">添加数字求和列</button>
         <button id="restore-default-columns-btn" class="secondary">一键整理（恢复默认排序）</button>
         <button class="secondary" onclick="closeModal('#column-modal')">取消</button>
         <button id="save-column-btn">保存</button>
@@ -258,6 +275,6 @@
     });
     document.getElementById('lightbox-img').addEventListener('pointerup', () => {lightboxDrag=null;});
   </script>
-  <script src="/static/js/app.js?v=20260902-02"></script>
+  <script src="/static/js/app.js?v=20260908-02"></script>
 </body>
 </html>

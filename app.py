@@ -1,13 +1,17 @@
 import os
 import io
 import json
+import base64
 import html
+import mimetypes
 import shutil
 import subprocess
 import re
 import posixpath
 import logging
 import sys
+from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 from datetime import datetime
@@ -19,6 +23,9 @@ from sqlalchemy import create_engine, text
 from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash, generate_password_hash
 import openpyxl
+from PIL import Image as PILImage
+from PIL import ImageDraw as PILImageDraw
+from PIL import ImageFont as PILImageFont
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
@@ -31,6 +38,7 @@ from openpyxl.worksheet.cell_range import CellRange
 import config
 from models import (
     db, Project, Version, CustomColumn, TestCase, CaseImage, CaseMerge,
+    Requirement, RequirementImage,
     Role, User, SYSTEM_COLUMNS, STATUS_LIST
 )
 
@@ -97,6 +105,14 @@ ADMIN_ENDPOINTS = {
     'update_version', 'delete_version', 'copy_version',
     'backup_database',
 }
+
+
+def normalize_row_height(value, default=36):
+    """统一校验前端传入的行高，避免异常值破坏表格布局。"""
+    try:
+        return max(24, min(360, int(value or default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def migrate_auth_schema():
@@ -395,17 +411,18 @@ def copy_version(project_id, version_id):
         db.session.add(new_version)
         db.session.flush()
         for source_column in query_version_columns(project_id, source.id):
-            db.session.add(CustomColumn(
+                db.session.add(CustomColumn(
                 project_id=project_id,
                 version_id=new_version.id,
                 name=source_column.name,
                 key=source_column.key,
                 is_system=source_column.is_system,
                 is_visible=source_column.is_visible,
-                width=source_column.width,
-                sort_order=source_column.sort_order,
-                text_align=source_column.text_align or 'left',
-            ))
+                    width=source_column.width,
+                    sort_order=source_column.sort_order,
+                    text_align=source_column.text_align or 'left',
+                    aggregate_type=source_column.aggregate_type or '',
+                ))
         source_cases = TestCase.query.filter_by(project_id=project_id, version_id=source.id) \
             .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
         case_id_map = {}
@@ -425,6 +442,7 @@ def copy_version(project_id, version_id):
                 remark=source_case.remark,
                 custom_fields=source_case.custom_fields,
                 sort_order=source_case.sort_order,
+                row_height=source_case.row_height or 36,
             )
             db.session.add(copied_case)
             db.session.flush()
@@ -476,8 +494,35 @@ def copy_version(project_id, version_id):
                 copied_merge.set_case_ids(copied_ids)
                 db.session.add(copied_merge)
 
+        source_requirements = Requirement.query.filter_by(
+            project_id=project_id, version_id=source.id
+        ).order_by(Requirement.sort_order.asc(), Requirement.id.asc()).all()
+        for source_requirement in source_requirements:
+            copied_requirement = Requirement(
+                project_id=project_id,
+                version_id=new_version.id,
+                title=source_requirement.title,
+                record_type=source_requirement.record_type,
+                content=source_requirement.content,
+                table_data=source_requirement.table_data,
+                sort_order=source_requirement.sort_order,
+            )
+            db.session.add(copied_requirement)
+            db.session.flush()
+            for source_image in source_requirement.images:
+                db.session.add(RequirementImage(
+                    requirement_id=copied_requirement.id,
+                    filename=source_image.filename,
+                    image_data=source_image.image_data,
+                    mime_type=source_image.mime_type or 'application/octet-stream',
+                ))
+
         db.session.commit()
-        return jsonify({'success': True, 'data': {'version': new_version.to_dict(), 'copied_cases': len(source_cases)}})
+        return jsonify({'success': True, 'data': {
+            'version': new_version.to_dict(),
+            'copied_cases': len(source_cases),
+            'copied_requirements': len(source_requirements),
+        }})
     except Exception as exc:
         db.session.rollback()
         return jsonify({'success': False, 'message': f'创建版本副本失败: {str(exc)}'}), 500
@@ -543,6 +588,147 @@ def delete_version(project_id, version_id):
     return jsonify({'success': True})
 
 
+# ------------------- 版本需求记录 -------------------
+REQUIREMENT_TYPES = {'memo', 'text', 'table', 'image'}
+
+
+def requirement_table_data(value):
+    """只保留二维字符串数组，避免需求表格数据混入任意对象。"""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or '[]')
+        except (TypeError, ValueError):
+            value = []
+    if not isinstance(value, list):
+        return []
+    rows = []
+    for row in value:
+        if not isinstance(row, list):
+            continue
+        rows.append([str(cell or '') for cell in row])
+    return rows
+
+
+def requirement_for_scope(requirement_id):
+    return Requirement.query.get_or_404(requirement_id)
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/requirements', methods=['GET'])
+def get_requirements(project_id, version_id):
+    Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
+    records = Requirement.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).order_by(Requirement.sort_order.asc(), Requirement.id.asc()).all()
+    return jsonify({'success': True, 'data': [record.to_dict() for record in records]})
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/requirements', methods=['POST'])
+def create_requirement(project_id, version_id):
+    Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
+    data = request.json or {}
+    title = (data.get('title') or '').strip()
+    # 新建需求默认使用备忘录正文；保留显式传入的旧类型，兼容历史接口调用。
+    record_type = str(data.get('record_type') or 'memo').strip().lower()
+    if not title:
+        return jsonify({'success': False, 'message': '需求标题不能为空'}), 400
+    if record_type not in REQUIREMENT_TYPES:
+        return jsonify({'success': False, 'message': '需求记录类型不支持'}), 400
+    max_order = db.session.query(db.func.max(Requirement.sort_order)).filter_by(
+        project_id=project_id, version_id=version_id
+    ).scalar()
+    record = Requirement(
+        project_id=project_id,
+        version_id=version_id,
+        title=title,
+        record_type=record_type,
+        content=str(data.get('content') or ''),
+        sort_order=(max_order if max_order is not None else -1) + 1,
+    )
+    record.set_table_data(requirement_table_data(data.get('table_data', [])))
+    db.session.add(record)
+    db.session.commit()
+    return jsonify({'success': True, 'data': record.to_dict()})
+
+
+@app.route('/api/requirements/<int:requirement_id>', methods=['PUT'])
+def update_requirement(requirement_id):
+    record = requirement_for_scope(requirement_id)
+    data = request.json or {}
+    if 'title' in data:
+        title = (data.get('title') or '').strip()
+        if not title:
+            return jsonify({'success': False, 'message': '需求标题不能为空'}), 400
+        record.title = title
+    if 'record_type' in data:
+        record_type = str(data.get('record_type') or '').strip().lower()
+        if record_type not in REQUIREMENT_TYPES:
+            return jsonify({'success': False, 'message': '需求记录类型不支持'}), 400
+        record.record_type = record_type
+    if 'content' in data:
+        record.content = str(data.get('content') or '')
+    if 'table_data' in data:
+        record.set_table_data(requirement_table_data(data.get('table_data')))
+    db.session.commit()
+    return jsonify({'success': True, 'data': record.to_dict()})
+
+
+@app.route('/api/requirements/<int:requirement_id>', methods=['DELETE'])
+def delete_requirement(requirement_id):
+    record = requirement_for_scope(requirement_id)
+    db.session.delete(record)
+    db.session.commit()
+    return jsonify({'success': True})
+
+
+@app.route('/api/requirements/<int:requirement_id>/images', methods=['GET'])
+def get_requirement_images(requirement_id):
+    record = requirement_for_scope(requirement_id)
+    return jsonify({'success': True, 'data': [image.to_dict() for image in record.images]})
+
+
+@app.route('/api/requirements/<int:requirement_id>/images', methods=['POST'])
+def upload_requirement_images(requirement_id):
+    record = requirement_for_scope(requirement_id)
+    files = request.files.getlist('images') or request.files.getlist('file')
+    if not files:
+        return jsonify({'success': False, 'message': '未上传图片'}), 400
+    created = []
+    for file in files:
+        image_data = file.read()
+        mime_type = detect_image_mime(image_data, file.mimetype, file.filename)
+        if not image_data or not mime_type.startswith('image/'):
+            continue
+        image = RequirementImage(
+            requirement_id=record.id,
+            filename=secure_filename(file.filename or '需求图片') or '需求图片',
+            image_data=image_data,
+            mime_type=mime_type,
+        )
+        db.session.add(image)
+        created.append(image)
+    if not created:
+        return jsonify({'success': False, 'message': '未找到有效图片'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': [image.to_dict() for image in created]})
+
+
+@app.route('/api/requirement-images/<int:image_id>/content', methods=['GET'])
+def get_requirement_image_content(image_id):
+    image = RequirementImage.query.get_or_404(image_id)
+    return send_file(
+        io.BytesIO(bytes(image.image_data)),
+        mimetype=detect_image_mime(image.image_data, image.mime_type, image.filename),
+    )
+
+
+@app.route('/api/requirement-images/<int:image_id>', methods=['DELETE'])
+def delete_requirement_image(image_id):
+    image = RequirementImage.query.get_or_404(image_id)
+    db.session.delete(image)
+    db.session.commit()
+    return jsonify({'success': True})
+
+
 # ------------------- 自定义列 -------------------
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/columns', methods=['GET'])
 def get_columns(project_id, version_id):
@@ -562,6 +748,9 @@ def add_column(project_id, version_id):
         return jsonify({'success': False, 'message': '列名和字段标识不能为空'}), 400
     if not key.isidentifier():
         return jsonify({'success': False, 'message': '字段标识需为合法标识符'}), 400
+    aggregate_type = str(data.get('aggregate_type') or '').strip().lower()
+    if aggregate_type not in {'', 'sum'}:
+        return jsonify({'success': False, 'message': '统计类型无效'}), 400
     if CustomColumn.query.filter_by(project_id=project_id, version_id=version_id, key=key).first():
         return jsonify({'success': False, 'message': '字段标识已存在'}), 400
 
@@ -576,7 +765,8 @@ def add_column(project_id, version_id):
         is_system=False,
         is_visible=True,
         width=int(data.get('width', 150)),
-        sort_order=max_order + 1
+        sort_order=max_order + 1,
+        aggregate_type=aggregate_type
     )
     db.session.add(col)
     db.session.commit()
@@ -646,6 +836,13 @@ def update_column(column_id):
         if text_align not in {'left', 'center', 'right'}:
             return jsonify({'success': False, 'message': '对齐方式无效'}), 400
         col.text_align = text_align
+    if 'aggregate_type' in data:
+        aggregate_type = str(data.get('aggregate_type') or '').strip().lower()
+        if aggregate_type not in {'', 'sum'}:
+            return jsonify({'success': False, 'message': '统计类型无效'}), 400
+        if col.is_system and aggregate_type:
+            return jsonify({'success': False, 'message': '系统列不能设置为数字求和列'}), 400
+        col.aggregate_type = aggregate_type
     db.session.commit()
     return jsonify({'success': True, 'data': col.to_dict()})
 
@@ -665,12 +862,34 @@ def update_columns_order(project_id, version_id):
     Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
     data = request.json or {}
     orders = data.get('orders', {})
+    assigned_ids = set()
+    next_order = 0
     for col_id, order in orders.items():
         col = CustomColumn.query.filter_by(
             id=col_id, project_id=project_id, version_id=version_id
         ).first()
         if col:
             col.sort_order = int(order)
+            assigned_ids.add(col.id)
+            next_order = max(next_order, int(order) + 1)
+    # 重新压紧排序值，但保留编辑模式下用户拖动后的实际顺序。
+    columns = CustomColumn.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    remaining = [column for column in columns if column.id not in assigned_ids]
+    remaining.sort(key=lambda column: (
+        column.sort_order if column.sort_order is not None else 0,
+        column.id or 0,
+    ))
+    for column in remaining:
+        column.sort_order = next_order
+        next_order += 1
+    columns.sort(key=lambda column: (
+        column.sort_order if column.sort_order is not None else 0,
+        column.id or 0,
+    ))
+    for index, column in enumerate(columns):
+        column.sort_order = index
     db.session.commit()
     return jsonify({'success': True})
 
@@ -928,9 +1147,9 @@ def normalize_merge_insert_target(project_id, version_id, target_id=None,
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/cases', methods=['GET'])
 def get_cases(project_id, version_id):
     page = request.args.get('page', 1, type=int)
-    page_size = request.args.get('page_size', 20, type=int)
+    page_size = request.args.get('page_size', 100, type=int)
     if page_size not in [20, 50, 100, 200, 300]:
-        page_size = 20
+        page_size = 100
     keyword = (request.args.get('keyword', '') or '').strip()
     status_filter = (request.args.get('status', '') or '').strip()
     status_filters = [value for value in status_filter.split(',') if value in STATUS_LIST]
@@ -948,7 +1167,19 @@ def get_cases(project_id, version_id):
         db.session.commit()
     query = TestCase.query.filter_by(project_id=project_id, version_id=version_id)
     if status_filters:
-        query = query.filter(TestCase.status.in_(status_filters))
+        status_conditions = []
+        ordinary_statuses = [value for value in status_filters if value != '未执行']
+        if ordinary_statuses:
+            status_conditions.append(TestCase.status.in_(ordinary_statuses))
+        if '未执行' in status_filters:
+            # 历史导入数据可能把未执行保存为空字符串；页面显示时虽已
+            # 兜底为“未执行”，查询也必须采用同一套语义。
+            status_conditions.append(db.or_(
+                TestCase.status == '未执行',
+                TestCase.status == '',
+                TestCase.status.is_(None),
+            ))
+        query = query.filter(db.or_(*status_conditions))
     if keyword:
         # 支持多个关键词，要求每个关键词都能在当前用例的任意字段中找到；
         # 同时覆盖系统字段和自定义字段，避免搜索结果过窄。
@@ -1000,7 +1231,10 @@ def get_cases(project_id, version_id):
         'page': page,
         'page_size': page_size,
         'columns': columns_dict,
-        'cases': [c.to_dict(columns_dict) for c in cases],
+        'cases': [
+            dict(c.to_dict(columns_dict), status=normalize_status(c.status))
+            for c in cases
+        ],
         'merges': merge_data
     }
     return jsonify({'success': True, 'data': data})
@@ -1011,7 +1245,7 @@ def rich_value_to_excel_text(value):
     raw = str(value or '')
     if not raw:
         return ''
-    if not re.search(r'<(?:img|br|div|p|s|strike|del)\b', raw, re.IGNORECASE):
+    if not re.search(r'<(?:img|br|div|p|s|strike|del|font|b|strong|i|em|u|span)\b', raw, re.IGNORECASE):
         return html.unescape(raw)
     text_value = re.sub(r'<img\b[^>]*>', '[图片]', raw, flags=re.IGNORECASE)
     text_value = re.sub(r'<br\s*/?>', '\n', text_value, flags=re.IGNORECASE)
@@ -1063,8 +1297,8 @@ def export_version_excel(project_id, version_id):
         return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
 
     init_system_columns(project_id, version_id)
-    columns = CustomColumn.query.filter_by(project_id=project_id, version_id=version_id, is_visible=True) \
-        .order_by(CustomColumn.sort_order.asc(), CustomColumn.id.asc()).all()
+    columns = [column for column in query_version_columns(project_id, version_id)
+               if column.is_visible]
     cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id) \
         .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
     merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version_id).all()
@@ -1130,7 +1364,10 @@ def export_version_excel(project_id, version_id):
                 cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                 status = normalize_status(raw_value)
                 cell.font = Font(name='Microsoft YaHei', size=10, color=status_colors.get(status, '1F2937'))
-        worksheet.row_dimensions[row_index].height = max(42, min(240, 78 * ((len(images) + 1) // 2)))
+        # openpyxl 使用磅，前端保存的是像素；图片较多时自动保证图片不会被行高裁切。
+        saved_height = max(24, min(360, int(case.row_height or 36))) * 0.75
+        image_height = 78 * ((len(images) + 1) // 2) if images else 0
+        worksheet.row_dimensions[row_index].height = max(18, min(270, max(saved_height, image_height)))
         if image_column_index:
             for image_index, image in enumerate(images):
                 try:
@@ -1223,6 +1460,7 @@ def create_case():
         priority=data.get('priority', ''),
         status=data.get('status', '未执行'),
         remark=data.get('remark', ''),
+        row_height=normalize_row_height(data.get('row_height')),
         sort_order=compute_sort_orders(project_id, version_id, count=1)[0]
     )
     if case.status not in STATUS_LIST:
@@ -1259,11 +1497,15 @@ def create_cases_batch():
     except (TypeError, ValueError):
         target_id = None
     position = data.get('insert_position')  # 'above' 或 'below'
+    insert_column_key = str(data.get('insert_column_key') or '').strip()
     valid_keys = {c.key for c in CustomColumn.query.filter_by(
         project_id=project_id, version_id=version_id, is_system=False).all()}
-    target_id, position = normalize_merge_insert_target(
-        project_id, version_id, target_id, position
-    )
+    # 用例编号列不允许合并。用户从该列发起插入时，必须使用真实目标行，
+    # 不能因为同一行的标题/模块等列属于合并区域而自动移动插入点。
+    if insert_column_key != 'case_no':
+        target_id, position = normalize_merge_insert_target(
+            project_id, version_id, target_id, position
+        )
     sort_orders = compute_sort_orders(project_id, version_id, target_id, position, len(cases_data))
     next_number = next_case_number(project_id, version_id)
 
@@ -1286,6 +1528,7 @@ def create_cases_batch():
             priority=item.get('priority', ''),
             status=item.get('status', '未执行'),
             remark=item.get('remark', ''),
+            row_height=normalize_row_height(item.get('row_height')),
             sort_order=sort_orders[i]
         )
         if case.status not in STATUS_LIST:
@@ -1303,9 +1546,10 @@ def create_cases_batch():
     ordered_cases = normalize_case_order(project_id, version_id, reset_numbers=True)
     inserted_ids = {case.id for case in created}
     if target_id and inserted_ids:
-        # 只有插入块位于原合并区域的内部时，才把新行加入合并关系。
-        # 插在合并首行上方或末行下方时，新行属于合并区域外，不能仅因
-        # 目标行属于合并区域就扩大 rowspan，否则会造成页面列错位。
+        # 插入点落在合并区域内部时，不能让 rowspan 跨过新增行：
+        # 这样会导致浏览器吞掉新增行或后续行的 td，出现整行向前错位。
+        # 将原合并区域拆成插入行前后的连续片段，片段不足两行则取消合并，
+        # 保证每个用例的真实字段都能独立显示、保存，不丢数据。
         positions = {case.id: index for index, case in enumerate(ordered_cases)}
         for merge in CaseMerge.query.filter_by(
                 project_id=project_id, version_id=version_id).all():
@@ -1314,14 +1558,34 @@ def create_cases_batch():
                                   if case_id in positions]
             inserted_positions = [positions[case_id] for case_id in inserted_ids
                                   if case_id in positions]
-            if (not existing_positions or not inserted_positions
+            if (len(existing_positions) < 2 or not inserted_positions
                     or min(inserted_positions) <= min(existing_positions)
                     or max(inserted_positions) >= max(existing_positions)):
                 continue
-            merge.set_case_ids([
-                case.id for case in ordered_cases
-                if case.id in existing_ids or case.id in inserted_ids
-            ])
+            start = min(existing_positions)
+            end = max(existing_positions)
+            fragments = []
+            fragment = []
+            for case in ordered_cases[start:end + 1]:
+                if case.id in existing_ids:
+                    fragment.append(case.id)
+                elif fragment:
+                    fragments.append(fragment)
+                    fragment = []
+            if fragment:
+                fragments.append(fragment)
+            valid_fragments = [fragment for fragment in fragments if len(fragment) >= 2]
+            if valid_fragments:
+                merge.set_case_ids(valid_fragments[0])
+                for fragment in valid_fragments[1:]:
+                    db.session.add(CaseMerge(
+                        project_id=project_id,
+                        version_id=version_id,
+                        column_key=merge.column_key,
+                        case_ids=json.dumps(fragment, ensure_ascii=False),
+                    ))
+            else:
+                db.session.delete(merge)
     db.session.commit()
     columns = query_version_columns(project_id, version_id)
     columns_dict = [c.to_dict() for c in columns]
@@ -1344,6 +1608,8 @@ def update_case(case_id):
     if 'status' in data and data['status'] in STATUS_LIST:
         case.status = data['status']
     case.remark = data.get('remark', case.remark)
+    if 'row_height' in data:
+        case.row_height = normalize_row_height(data.get('row_height'))
 
     custom = data.get('custom_fields', {}) or {}
     if not isinstance(custom, dict):
@@ -1405,8 +1671,117 @@ def delete_cases_batch():
 
 
 # ------------------- 统计 -------------------
+MEASUREMENT_UNITS = {
+    'km': {'family': 'distance', 'factor': Decimal('1000'), 'display': 'km'},
+    'm': {'family': 'distance', 'factor': Decimal('1'), 'display': 'm'},
+    'mile': {'family': 'distance', 'factor': Decimal('1609.344'), 'display': 'mi'},
+    'h': {'family': 'time', 'factor': Decimal('3600'), 'display': 'h'},
+    'min': {'family': 'time', 'factor': Decimal('60'), 'display': 'min'},
+    's': {'family': 'time', 'factor': Decimal('1'), 'display': 's'},
+}
+
+
+def normalize_measurement_unit(value):
+    text_value = str(value or '').strip().lower()
+    aliases = {
+        '公里': 'km', '千米': 'km', '千米数': 'km', 'km': 'km',
+        '米': 'm', 'm': 'm',
+        '英里': 'mile', 'mile': 'mile', 'mi': 'mile',
+        '小时': 'h', '时': 'h', 'h': 'h',
+        '分钟': 'min', '分': 'min', 'min': 'min',
+        '秒': 's', 's': 's',
+    }
+    return aliases.get(text_value)
+
+
+def parse_measurement(value):
+    """解析单元格中的数字和可选单位，支持 1.2、1.2km、1.2 公里。"""
+    raw = re.sub(r'<[^>]+>', '', str(value or '')).strip().replace(',', '')
+    if not raw:
+        return Decimal('0'), None
+    matched = re.match(r'^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([^\d\s]*)$', raw)
+    if not matched:
+        return Decimal('0'), None
+    try:
+        number = Decimal(matched.group(1))
+    except (InvalidOperation, ValueError):
+        return Decimal('0'), None
+    return number, normalize_measurement_unit(matched.group(2))
+
+
+def infer_column_unit(column_name, values):
+    """优先使用单元格显式单位，否则根据列名推断常用单位。"""
+    for value in values:
+        _, unit = parse_measurement(value)
+        if unit:
+            return unit
+    name = str(column_name or '').lower()
+    if re.search(r'公里|千米|\bkm\b', name):
+        return 'km'
+    if re.search(r'英里|\bmile\b|\bmi\b', name):
+        return 'mile'
+    if '里程' in name or '路程' in name or '距离' in name:
+        return 'km'
+    if re.search(r'小时|时长|\bh\b', name):
+        return 'h'
+    if re.search(r'分钟|\bmin\b', name):
+        return 'min'
+    if re.search(r'秒|\bs\b', name):
+        return 's'
+    if re.search(r'米|\bm\b', name):
+        return 'm'
+    return None
+
+
+def decimal_sum_text(value):
+    """以不带科学计数法、去掉无意义尾零的形式返回总和。"""
+    if value == 0:
+        return '0'
+    text_value = format(value, 'f')
+    if '.' in text_value:
+        text_value = text_value.rstrip('0').rstrip('.')
+    return text_value or '0'
+
+
+def build_numeric_column_totals(project_id, version_id, columns=None, cases=None):
+    columns = columns if columns is not None else query_version_columns(project_id, version_id)
+    cases = cases if cases is not None else TestCase.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    totals = []
+    for column in columns:
+        if (column.aggregate_type or '') != 'sum':
+            continue
+        values = [export_column_value(case, column) for case in cases]
+        target_unit = infer_column_unit(column.name, values)
+        total = Decimal('0')
+        for value in values:
+            number, source_unit = parse_measurement(value)
+            if target_unit:
+                target = MEASUREMENT_UNITS[target_unit]
+                if source_unit:
+                    source = MEASUREMENT_UNITS[source_unit]
+                    if source['family'] != target['family']:
+                        continue
+                    total += number * source['factor'] / target['factor']
+                else:
+                    total += number
+            else:
+                total += number
+        totals.append({
+            'key': column.key,
+            'name': column.name,
+            'value': decimal_sum_text(total),
+            'unit': MEASUREMENT_UNITS[target_unit]['display'] if target_unit else '',
+        })
+    return totals
+
+
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/stats', methods=['GET'])
 def get_stats(project_id, version_id):
+    Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
+    init_system_columns(project_id, version_id)
+    columns = query_version_columns(project_id, version_id)
     all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
     logical_cases = [group[0] for group in logical_case_groups(
         project_id, version_id, all_cases
@@ -1414,7 +1789,8 @@ def get_stats(project_id, version_id):
     total = len(logical_cases)
     stats = {}
     for status in STATUS_LIST:
-        count = sum(1 for case in logical_cases if case.status == status)
+        # 与用例列表筛选及页面展示保持一致：历史数据中的空值也属于“未执行”。
+        count = sum(1 for case in logical_cases if normalize_status(case.status) == status)
         stats[status] = {
             'count': count,
             'percent': round(count / total * 100, 1) if total else 0
@@ -1423,66 +1799,374 @@ def get_stats(project_id, version_id):
         'success': True,
         'data': {
             'total': total,
-            'stats': stats
+            'stats': stats,
+            'numeric_totals': build_numeric_column_totals(
+                project_id, version_id, columns=columns, cases=all_cases
+            ),
         }
     })
+
+
+def summary_text(value):
+    """把富文本字段转换为总结用纯文本，图片始终不混入问题文字。"""
+    value = str(value or '')
+    value = re.sub(r'<img\b[^>]*>', '', value, flags=re.IGNORECASE)
+    value = re.sub(r'<br\s*/?>', '\n', value, flags=re.IGNORECASE)
+    value = re.sub(r'</(?:div|p)>', '\n', value, flags=re.IGNORECASE)
+    value = re.sub(r'<[^>]+>', '', value)
+    value = html.unescape(value)
+    value = re.sub(r'[ \t]+\n', '\n', value)
+    return value.strip()
+
+
+def summary_column_value(case, column):
+    if column.is_system:
+        return getattr(case, column.key, '')
+    return (case.get_custom_fields() or {}).get(column.key, '')
+
+
+def build_summary_data(project_id, version_id, field_key='remark'):
+    """按当前版本生成总结数据，字段和图片均严格限制在当前版本。"""
+    version = Version.query.filter_by(id=version_id, project_id=project_id).first()
+    if not version:
+        return None
+    init_system_columns(project_id, version_id)
+    columns = query_version_columns(project_id, version_id)
+    column_map = {column.key: column for column in columns}
+    selected_column = column_map.get(str(field_key or '').strip()) or column_map.get('remark')
+    if selected_column is None and columns:
+        selected_column = columns[0]
+
+    all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+    logical_groups = [group for group in logical_case_groups(
+        project_id, version_id, all_cases
+    ) if group]
+    logical_cases = [group[0] for group in logical_groups]
+    total = len(logical_cases)
+    counts = {status: sum(1 for case in logical_cases if normalize_status(case.status) == status)
+              for status in STATUS_LIST}
+
+    def reasons(groups):
+        result = []
+        for group in groups:
+            case = group[0]
+            values = []
+            if selected_column:
+                for member in group:
+                    value = summary_text(summary_column_value(member, selected_column))
+                    if value:
+                        values.append(value)
+            images = []
+            for member in group:
+                for image in member.images:
+                    if image.image_data:
+                        images.append(image.to_dict())
+            result.append({
+                'id': case.id,
+                'case_no': case.case_no,
+                'title': summary_text(case.title) or '未命名用例',
+                'reason': '\n'.join(values) or '未填写问题描述',
+                'images': images,
+            })
+        return result
+
+    completed = total - counts['未执行']
+    completed_percent = round(completed / total * 100, 1) if total else 0
+    fields = [
+        {'key': column.key, 'name': column.name, 'is_system': bool(column.is_system)}
+        for column in columns
+    ]
+    return {
+        'total': total,
+        'completed': completed,
+        'completed_percent': completed_percent,
+        # 保留旧字段，避免已有页面或外部调用出现兼容问题。
+        'executed': completed,
+        'success': counts['通过'],
+        'fail': counts['失败'],
+        'block': counts['阻塞'],
+        'skip': counts['跳过'],
+        'unexecuted': counts['未执行'],
+        'summary_field_key': selected_column.key if selected_column else '',
+        'summary_field_name': selected_column.name if selected_column else '',
+        'summary_fields': fields,
+        'fail_reasons': reasons([group for group in logical_groups if group[0].status == '失败']),
+        'skip_reasons': reasons([group for group in logical_groups if group[0].status == '跳过']),
+        'block_reasons': reasons([group for group in logical_groups if group[0].status == '阻塞']),
+        'can_summarize': counts['未执行'] == 0 and total > 0,
+    }
 
 
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/summary', methods=['GET'])
 def get_summary(project_id, version_id):
-    all_cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
-    logical_cases = [group[0] for group in logical_case_groups(
-        project_id, version_id, all_cases
-    ) if group]
-    total = len(logical_cases)
-    counts = {}
-    for status in STATUS_LIST:
-        counts[status] = sum(1 for case in logical_cases if case.status == status)
+    data = build_summary_data(
+        project_id, version_id, request.args.get('field_key', 'remark')
+    )
+    if data is None:
+        return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
+    return jsonify({'success': True, 'data': data})
 
-    executed = total - counts['跳过'] - counts['阻塞']
-    fail_cases = [case for case in logical_cases if case.status == '失败']
-    skip_cases = [case for case in logical_cases if case.status == '跳过']
-    block_cases = [case for case in logical_cases if case.status == '阻塞']
 
-    def summary_text(value):
-        """把富文本备注转换为总结用纯文本，图片只从总结中排除。"""
-        value = str(value or '')
-        value = re.sub(r'<img\b[^>]*>', '', value, flags=re.IGNORECASE)
-        value = re.sub(r'<br\s*/?>', '\n', value, flags=re.IGNORECASE)
-        value = re.sub(r'</(?:div|p)>', '\n', value, flags=re.IGNORECASE)
-        value = re.sub(r'<[^>]+>', '', value)
-        value = html.unescape(value)
-        value = re.sub(r'[ \t]+\n', '\n', value)
-        return value.strip()
+def summary_export_html(project, version, data, show_images):
+    """生成自包含总结 HTML；图片直接使用数据库二进制转成 data URI。"""
+    sections = (
+        ('失败问题', data['fail_reasons']),
+        ('阻塞问题', data['block_reasons']),
+        ('跳过问题', data['skip_reasons']),
+    )
+    def render_items(items):
+        if not items:
+            return '<p class="empty">无</p>'
+        html_items = []
+        for item in items:
+            images = ''
+            if show_images:
+                image_tags = []
+                for image in item.get('images', []):
+                    record = CaseImage.query.get(image['id'])
+                    if not record or not record.image_data:
+                        continue
+                    encoded = base64.b64encode(bytes(record.image_data)).decode('ascii')
+                    mime = html.escape(
+                        detect_image_mime(record.image_data, record.mime_type, record.filename),
+                        quote=True,
+                    )
+                    image_tags.append(
+                        f'<img src="data:{mime};base64,{encoded}" alt="图片">'
+                    )
+                if image_tags:
+                    images = '<div class="summary-images">' + ''.join(image_tags) + '</div>'
+            html_items.append(
+                f'<li><strong>{html.escape(str(item.get("title") or "未命名用例"))}</strong>'
+                f'：<span class="summary-reason">{html.escape(str(item.get("reason") or "未填写问题描述")).replace(chr(10), "<br>")}</span> '
+                f'（{html.escape(str(item.get("case_no") or "未编号"))}）{images}</li>'
+            )
+        return '<ol>' + ''.join(html_items) + '</ol>'
 
-    def reasons(cases):
-        result = []
-        for c in cases:
-            remark = summary_text(c.remark)
-            result.append({
-                'id': c.id,
-                'case_no': c.case_no,
-                'title': c.title,
-                'reason': remark or '未填写问题描述',
-            })
-        return result
+    section_html = ''.join(
+        f'<section><h2>{title}（{len(items)}）</h2>{render_items(items)}</section>'
+        for title, items in sections
+    )
+    image_note = '显示图片' if show_images else '不显示图片'
+    return f'''<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(project.name)} / {html.escape(version.version_name)} 执行总结</title>
+<style>
+body{{margin:0;padding:28px;background:#f5f7fa;color:#303133;font:14px/1.7 "Microsoft YaHei",sans-serif}}
+.page{{max-width:1100px;margin:auto;background:#fff;padding:28px 34px;border-radius:10px}}
+h1{{margin:0 0 4px}} .meta{{color:#909399;margin-bottom:20px}}
+.cards{{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:26px}}
+.card{{padding:12px;text-align:center;background:#f5f7fa;border-radius:8px}} .num{{font-size:25px;font-weight:bold}}
+section{{margin-top:22px}} h2{{font-size:17px;border-bottom:1px solid #ebeef5;padding-bottom:7px}}
+li{{margin:8px 0}} .summary-reason{{color:#f56c6c}} .empty{{color:#909399}} .summary-images{{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}}
+.summary-images img{{max-width:220px;max-height:160px;object-fit:contain;border:1px solid #dcdfe6;border-radius:5px}}
+@media(max-width:760px){{.cards{{grid-template-columns:repeat(3,1fr)}}}}
+</style></head><body><main class="page">
+<h1>{html.escape(project.name)} / {html.escape(version.version_name)} 执行总结</h1>
+<div class="meta">总结字段：{html.escape(data['summary_field_name'] or '备注')}　|　{image_note}</div>
+<div class="cards"><div class="card"><div class="num">{data['total']}</div>总用例</div>
+<div class="card"><div class="num">{data['completed']}</div>完成</div><div class="card completion"><div class="num">{data['completed_percent']}%</div>完成率</div><div class="card"><div class="num">{data['unexecuted']}</div>未执行</div>
+<div class="card"><div class="num">{data['success']}</div>通过</div><div class="card"><div class="num">{data['fail']}</div>失败</div><div class="card"><div class="num">{data['block']}</div>阻塞</div><div class="card"><div class="num">{data['skip']}</div>跳过</div></div>
+{section_html}</main></body></html>'''
 
-    return jsonify({
-        'success': True,
-        'data': {
-            'total': total,
-            'executed': executed,
-            'success': counts['通过'],
-            'fail': counts['失败'],
-            'block': counts['阻塞'],
-            'skip': counts['跳过'],
-            'unexecuted': counts['未执行'],
-            'fail_reasons': reasons(fail_cases),
-            'skip_reasons': reasons(skip_cases),
-            'block_reasons': reasons(block_cases),
-            'can_summarize': counts['未执行'] == 0 and total > 0
-        }
-    })
+
+def render_summary_png(project, version, data, show_images):
+    """使用 Pillow 直接生成 PNG，避免浏览器 SVG/Canvas 污染导致导出失败。"""
+    width = 1200
+    margin = 60
+    content_width = width - margin * 2
+    background = (245, 247, 250)
+    text_color = (48, 49, 51)
+    muted_color = (144, 147, 153)
+    red_color = (245, 108, 108)
+
+    font_paths = [
+        os.path.join('C:', os.sep, 'Windows', 'Fonts', 'msyh.ttc'),
+        os.path.join('C:', os.sep, 'Windows', 'Fonts', 'NotoSansSC-VF.ttf'),
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ]
+
+    def font(size, bold=False):
+        candidates = font_paths[:]
+        if bold:
+            candidates.insert(0, os.path.join('C:', os.sep, 'Windows', 'Fonts', 'msyhbd.ttc'))
+        for path in candidates:
+            try:
+                return PILImageFont.truetype(path, size, index=0)
+            except (OSError, TypeError):
+                continue
+        return PILImageFont.load_default()
+
+    title_font = font(28, True)
+    meta_font = font(15)
+    section_font = font(20, True)
+    body_font = font(16)
+    bold_font = font(16, True)
+    small_font = font(14)
+    card_num_font = font(25, True)
+
+    # 先使用足够高度的画布，内容绘制完成后再裁剪，避免长总结在 1000px 处被截断。
+    image = PILImage.new('RGB', (width, 6000), background)
+    draw = PILImageDraw.Draw(image)
+
+    def wrap_text(value, text_font, max_width):
+        text = str(value or '')
+        lines = []
+        for paragraph in text.replace('\r\n', '\n').split('\n'):
+            if not paragraph:
+                lines.append('')
+                continue
+            current = ''
+            for char in paragraph:
+                candidate = current + char
+                if current and draw.textlength(candidate, font=text_font) > max_width:
+                    lines.append(current)
+                    current = char
+                else:
+                    current = candidate
+            lines.append(current)
+        return lines or ['']
+
+    def draw_lines(value, x, y, text_font, color, max_width, line_height=26):
+        lines = wrap_text(value, text_font, max_width)
+        for line in lines:
+            draw.text((x, y), line, font=text_font, fill=color)
+            y += line_height
+        return y
+
+    def rounded_box(x, y, w, h, fill, radius=8):
+        draw.rounded_rectangle((x, y, x + w, y + h), radius=radius, fill=fill)
+
+    y = 42
+    draw.text((margin, y), f'{project.name} / {version.version_name} 执行总结', font=title_font, fill=text_color)
+    y += 48
+    field_name = data.get('summary_field_name') or '备注'
+    image_note = '显示图片' if show_images else '不显示图片'
+    draw.text((margin, y), f'总结字段：{field_name}  |  {image_note}', font=meta_font, fill=muted_color)
+    y += 38
+
+    cards = [
+        ('总用例', data.get('total', 0), (245, 247, 250), text_color),
+        ('完成', data.get('completed', 0), (245, 247, 250), text_color),
+        ('完成率', f"{data.get('completed_percent', 0)}%", (238, 246, 255), (64, 158, 255)),
+        ('未执行', data.get('unexecuted', 0), (245, 247, 250), text_color),
+        ('通过', data.get('success', 0), (240, 249, 235), (103, 194, 58)),
+        ('失败', data.get('fail', 0), (254, 240, 240), (245, 108, 108)),
+        ('阻塞', data.get('block', 0), (253, 246, 236), (230, 162, 60)),
+        ('跳过', data.get('skip', 0), (236, 245, 255), (64, 158, 255)),
+    ]
+    card_gap = 12
+    card_width = (content_width - card_gap * 3) // 4
+    card_height = 78
+    for index, (label, value, fill, number_color) in enumerate(cards):
+        row, column = divmod(index, 4)
+        x = margin + column * (card_width + card_gap)
+        card_y = y + row * (card_height + card_gap)
+        rounded_box(x, card_y, card_width, card_height, fill)
+        value_text = str(value)
+        value_box = draw.textbbox((0, 0), value_text, font=card_num_font)
+        value_x = x + (card_width - (value_box[2] - value_box[0])) // 2
+        draw.text((value_x, card_y + 10), value_text, font=card_num_font, fill=number_color)
+        label_box = draw.textbbox((0, 0), label, font=small_font)
+        label_x = x + (card_width - (label_box[2] - label_box[0])) // 2
+        draw.text((label_x, card_y + 49), label, font=small_font, fill=text_color)
+    y += 2 * card_height + card_gap + 30
+
+    sections = (
+        ('失败问题', data.get('fail_reasons') or []),
+        ('阻塞问题', data.get('block_reasons') or []),
+        ('跳过问题', data.get('skip_reasons') or []),
+    )
+    for section_title, items in sections:
+        draw.text((margin, y), f'{section_title}（{len(items)}）', font=section_font, fill=text_color)
+        y += 36
+        draw.line((margin, y, width - margin, y), fill=(235, 238, 245), width=1)
+        y += 14
+        if not items:
+            draw.text((margin + 6, y), '无', font=small_font, fill=muted_color)
+            y += 30
+            continue
+        for item_index, item in enumerate(items, 1):
+            title = str(item.get('title') or '未命名用例')
+            reason = str(item.get('reason') or '未填写问题描述')
+            case_no = str(item.get('case_no') or '未编号')
+            prefix = f'{item_index}. {title}：'
+            draw.text((margin + 6, y), prefix, font=bold_font, fill=text_color)
+            prefix_width = draw.textlength(prefix, font=bold_font)
+            reason_x = margin + 6 + int(prefix_width)
+            reason_width = max(220, width - margin - reason_x - 90)
+            reason_y = draw_lines(reason, reason_x, y, body_font, red_color, reason_width)
+            case_text = f'（{case_no}）'
+            draw.text((width - margin - draw.textlength(case_text, font=small_font), reason_y - 26), case_text, font=small_font, fill=text_color)
+            y = max(reason_y, y + 26) + 8
+            if show_images:
+                for image_info in item.get('images') or []:
+                    record = CaseImage.query.get(image_info.get('id'))
+                    if not record or not record.image_data:
+                        continue
+                    try:
+                        embedded = PILImage.open(io.BytesIO(bytes(record.image_data))).convert('RGB')
+                        embedded.thumbnail((220, 160))
+                        image.paste(embedded, (reason_x, y))
+                        y += embedded.height + 12
+                    except Exception:
+                        continue
+            y += 8
+        y += 12
+
+    final_height = max(900, min(y + 35, 6000))
+    if final_height != image.height:
+        image = image.crop((0, 0, width, final_height))
+    output = io.BytesIO()
+    image.save(output, format='PNG', optimize=True)
+    return output.getvalue()
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/summary/export', methods=['GET'])
+def export_summary(project_id, version_id):
+    project = Project.query.get(project_id)
+    version = Version.query.filter_by(id=version_id, project_id=project_id).first()
+    if not project or not version:
+        return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
+    data = build_summary_data(
+        project_id, version_id, request.args.get('field_key', 'remark')
+    )
+    show_images = request.args.get('show_images', '0').lower() in {'1', 'true', 'yes'}
+    file_format = request.args.get('format', 'html').lower()
+    if file_format not in {'html', 'png', 'svg'}:
+        return jsonify({'success': False, 'message': '导出格式不支持'}), 400
+    if file_format == 'html':
+        content = summary_export_html(project, version, data, show_images).encode('utf-8')
+        return send_file(
+            io.BytesIO(content), as_attachment=True,
+            download_name=f'{project.name}_{version.version_name}_执行总结.html',
+            mimetype='text/html; charset=utf-8'
+        )
+    if file_format == 'png':
+        content = render_summary_png(project, version, data, show_images)
+        return send_file(
+            io.BytesIO(content), as_attachment=True,
+            download_name=f'{project.name}_{version.version_name}_执行总结.png',
+            mimetype='image/png'
+        )
+    html_content = summary_export_html(project, version, data, show_images)
+    style_match = re.search(r'<style>([\s\S]*?)</style>', html_content, re.IGNORECASE)
+    body_match = re.search(r'<body>([\s\S]*?)</body>', html_content, re.IGNORECASE)
+    svg_style = style_match.group(1) if style_match else ''
+    svg_body = body_match.group(1) if body_match else ''
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" '
+        'viewBox="0 0 1200 900"><foreignObject x="0" y="0" width="1200" height="900">'
+        '<div xmlns="http://www.w3.org/1999/xhtml" style="width:1120px;min-height:820px;padding:40px;background:#f5f7fa">'
+        f'<style>{svg_style}</style>'
+        + svg_body
+        + '</div></foreignObject></svg>'
+    ).encode('utf-8')
+    return send_file(
+        io.BytesIO(svg), as_attachment=True,
+        download_name=f'{project.name}_{version.version_name}_执行总结.svg',
+        mimetype='image/svg+xml'
+    )
 
 
 # ------------------- Excel 导入 -------------------
@@ -1987,6 +2671,35 @@ def import_cases(project_id, version_id):
 
 
 # ------------------- 图片上传 -------------------
+def detect_image_mime(image_data, stored_mime='', filename=''):
+    """识别图片真实 MIME，兼容历史记录中的 application/octet-stream。"""
+    stored = (stored_mime or '').split(';', 1)[0].strip().lower()
+    if stored.startswith('image/'):
+        return 'image/jpeg' if stored == 'image/jpg' else stored
+
+    guessed = mimetypes.guess_type(str(filename or ''))[0] or ''
+    if guessed.startswith('image/'):
+        return guessed
+
+    try:
+        with PILImage.open(io.BytesIO(bytes(image_data or b''))) as image:
+            image_format = (image.format or '').upper()
+        format_mimes = {
+            'PNG': 'image/png',
+            'JPEG': 'image/jpeg',
+            'JPG': 'image/jpeg',
+            'GIF': 'image/gif',
+            'WEBP': 'image/webp',
+            'BMP': 'image/bmp',
+            'TIFF': 'image/tiff',
+        }
+        if image_format in format_mimes:
+            return format_mimes[image_format]
+    except (OSError, TypeError, ValueError):
+        pass
+    return stored or 'application/octet-stream'
+
+
 @app.route('/api/cases/<int:case_id>/images', methods=['POST'])
 def upload_image(case_id):
     case = TestCase.query.get_or_404(case_id)
@@ -2001,11 +2714,12 @@ def upload_image(case_id):
         image_data = file.read()
         if not image_data:
             continue
+        mime_type = detect_image_mime(image_data, file.mimetype, file.filename)
         img = CaseImage(
             test_case_id=case_id,
             filename=file.filename,
             image_data=image_data,
-            mime_type=file.mimetype or 'application/octet-stream',
+            mime_type=mime_type,
         )
         db.session.add(img)
         saved.append(img)
@@ -2034,7 +2748,7 @@ def serve_image_content(image_id):
     if img.image_data:
         return send_file(
             io.BytesIO(bytes(img.image_data)),
-            mimetype=img.mime_type or 'application/octet-stream',
+            mimetype=detect_image_mime(img.image_data, img.mime_type, img.filename),
             download_name=img.filename or 'image',
             max_age=31536000,
         )
@@ -2120,9 +2834,19 @@ def migrate_sort_order():
                 pass  # 字段已存在
             conn.execute(text("UPDATE custom_columns SET text_align = 'left' WHERE text_align IS NULL OR text_align = ''"))
             try:
+                conn.execute(text("ALTER TABLE custom_columns ADD COLUMN aggregate_type VARCHAR(20) NOT NULL DEFAULT ''"))
+            except Exception:
+                pass  # 字段已存在
+            conn.execute(text("UPDATE custom_columns SET aggregate_type = '' WHERE aggregate_type IS NULL"))
+            try:
                 conn.execute(text("ALTER TABLE test_cases ADD COLUMN sort_order INT DEFAULT 0"))
             except Exception:
                 pass  # 字段已存在
+            try:
+                conn.execute(text("ALTER TABLE test_cases ADD COLUMN row_height INT NOT NULL DEFAULT 36"))
+            except Exception:
+                pass  # 字段已存在
+            conn.execute(text("UPDATE test_cases SET row_height = 36 WHERE row_height IS NULL OR row_height < 24"))
             conn.execute(text("UPDATE test_cases SET sort_order = id * 1000 WHERE sort_order IS NULL OR sort_order = 0"))
             version_sort_added = False
             try:
