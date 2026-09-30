@@ -1,9 +1,64 @@
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 import json
+import re
 from sqlalchemy.dialects.mysql import LONGBLOB
 
 db = SQLAlchemy()
+
+
+_CASE_IMAGE_TAG_PATTERN = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+
+
+def normalize_case_image_markup(value, images, fallback_index):
+    """将用例正文中的图片引用校正到该用例实际拥有的图片记录。
+
+    历史数据可能因为导入、复制版本或图片记录迁移，保留了已经不存在的
+    ``data-image-id``。图片本体仍在 ``case_images`` 中时，按正文里的图片
+    顺序绑定当前用例图片，并同步修正 src，避免页面显示损坏图片。
+    """
+    if not isinstance(value, str) or not value or '<img' not in value.lower():
+        return value
+    available_images = [image for image in images if image.image_data]
+    if not available_images:
+        return value
+    valid_images = {str(image.id): image for image in available_images}
+
+    def replace_tag(match):
+        tag = match.group(0)
+        image_match = re.search(
+            r'data-image-id\s*=\s*["\'](\d+)["\']', tag, re.IGNORECASE
+        )
+        image = valid_images.get(image_match.group(1)) if image_match else None
+        if image is None:
+            index = min(fallback_index[0], len(available_images) - 1)
+            image = available_images[index]
+            fallback_index[0] += 1
+
+        content_url = f'/api/images/{image.id}/content'
+        if image_match:
+            tag = re.sub(
+                r'(data-image-id\s*=\s*["\'])\d+(["\'])',
+                lambda item: f'{item.group(1)}{image.id}{item.group(2)}',
+                tag,
+                flags=re.IGNORECASE,
+            )
+        else:
+            tag = tag[:-1] + f' data-image-id="{image.id}">' \
+                if tag.endswith('>') else tag
+        if re.search(r'src\s*=', tag, re.IGNORECASE):
+            tag = re.sub(
+                r'(src\s*=\s*["\'])[^"\']*(["\'])',
+                lambda item: f'{item.group(1)}{content_url}{item.group(2)}',
+                tag,
+                flags=re.IGNORECASE,
+            )
+        else:
+            tag = tag[:-1] + f' src="{content_url}">' \
+                if tag.endswith('>') else tag
+        return tag
+
+    return _CASE_IMAGE_TAG_PATTERN.sub(replace_tag, value)
 
 
 class Role(db.Model):
@@ -27,6 +82,8 @@ class User(db.Model):
     username = db.Column(db.String(100), nullable=False, unique=True)
     password_hash = db.Column(db.String(255), nullable=False)
     role_id = db.Column(db.Integer, db.ForeignKey('roles.id'), nullable=False)
+    # 数据范围由账号记录维护。shared 为正式账号共用数据，其他值表示独立演示/客户空间。
+    data_scope = db.Column(db.String(100), nullable=False, default='shared')
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
@@ -41,6 +98,7 @@ class User(db.Model):
             'role_name': role.name if role else '',
             'can_write': bool(role.can_write) if role and role.can_write is not None else False,
             'can_manage': bool(role.can_manage) if role and role.can_manage is not None else False,
+            'data_scope': self.data_scope or 'shared',
             'is_active': self.is_active,
         }
 
@@ -50,6 +108,8 @@ class Project(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     name = db.Column(db.String(255), nullable=False, unique=True)
     description = db.Column(db.Text, default='')
+    sort_order = db.Column(db.Integer, nullable=False, default=0)
+    data_scope = db.Column(db.String(100), nullable=False, default='shared')
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -63,6 +123,7 @@ class Project(db.Model):
             'id': self.id,
             'name': self.name,
             'description': self.description,
+            'sort_order': self.sort_order,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
         }
@@ -105,6 +166,9 @@ class CustomColumn(db.Model):
     sort_order = db.Column(db.Integer, default=0)           # 排序
     text_align = db.Column(db.String(10), nullable=False, default='left')  # left/center/right
     aggregate_type = db.Column(db.String(20), nullable=False, default='')  # '' 或 sum：数字求和列
+    # 仅优先级系统列使用：codes=P0/P1/P2/P3，levels=重要/高/中/低。
+    # 这里只保存显示模式，不改写历史用例中的优先级原始值。
+    priority_mode = db.Column(db.String(20), nullable=False, default='codes')
     created_at = db.Column(db.DateTime, default=datetime.now)
 
     def to_dict(self):
@@ -120,6 +184,7 @@ class CustomColumn(db.Model):
             'sort_order': self.sort_order,
             'text_align': self.text_align or 'left',
             'aggregate_type': self.aggregate_type or '',
+            'priority_mode': self.priority_mode or 'codes',
         }
 
 
@@ -173,10 +238,24 @@ class TestCase(db.Model):
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
         }
-        custom = self.get_custom_fields()
+        # 兼容历史数据中失效的图片 ID；系统字段和自定义字段统一校正，
+        # 列表、编辑窗口、总结和导出读取到的内容保持一致。
+        case_images = list(self.images or [])
+        image_fallback_index = [0]
+        for field_name in (
+            'module', 'title', 'precondition', 'steps',
+            'expected_result', 'remark',
+        ):
+            data[field_name] = normalize_case_image_markup(
+                data[field_name], case_images, image_fallback_index
+            )
+        custom = {
+            key: normalize_case_image_markup(value, case_images, image_fallback_index)
+            for key, value in self.get_custom_fields().items()
+        }
         data['custom_fields'] = custom
         # 列表页需要直接拿到用例附件，才能在对应行展示缩略图。
-        data['images'] = [image.to_dict() for image in self.images]
+        data['images'] = [image.to_dict() for image in case_images]
         if columns:
             for col in columns:
                 if not col['is_system'] and col['key'] not in data:
@@ -311,5 +390,10 @@ SYSTEM_COLUMNS = [
     {'key': 'status', 'name': '执行结果', 'width': 120, 'is_system': True},
     {'key': 'remark', 'name': '备注', 'width': 200, 'is_system': True},
 ]
+
+PRIORITY_DISPLAY_MODES = {
+    'codes': ('P0', 'P1', 'P2', 'P3'),
+    'levels': ('重要', '高', '中', '低'),
+}
 
 STATUS_LIST = ['通过', '失败', '未执行', '阻塞', '跳过']

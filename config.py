@@ -12,8 +12,9 @@ DB_USER = os.getenv('DB_USER', 'root')
 DB_PASSWORD = os.getenv('DB_PASSWORD', '123456')
 DB_NAME = os.getenv('DB_NAME', 'case_manager')
 
-# 数据库备份目录
-BACKUP_DIR = os.getenv('BACKUP_DIR', os.path.join(BASE_DIR, 'backups'))
+# 定时全量备份目录。备份文件包含所有表数据及图片二进制，不使用旧的 SQL
+# 手动备份目录，避免把两套格式混在一起。
+BACKUP_DIR = os.path.join(BASE_DIR, 'Data_Backup')
 
 # 项目删除密码
 DELETE_PASSWORD = os.getenv('DELETE_PASSWORD', '000000')

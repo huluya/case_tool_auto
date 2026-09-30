@@ -4,17 +4,18 @@ import json
 import base64
 import html
 import mimetypes
-import shutil
-import subprocess
 import re
 import posixpath
 import logging
 import sys
+import threading
+import time
 from decimal import Decimal, InvalidOperation
 from decimal import Decimal, InvalidOperation
-from zipfile import BadZipFile, ZipFile
+from html.parser import HTMLParser
+from zipfile import BadZipFile, ZipFile, ZIP_DEFLATED
 from xml.etree import ElementTree as ET
-from datetime import datetime
+from datetime import datetime, date, time as datetime_time
 from logging.handlers import RotatingFileHandler
 
 from flask import Flask, request, jsonify, send_file, render_template, session
@@ -39,7 +40,8 @@ import config
 from models import (
     db, Project, Version, CustomColumn, TestCase, CaseImage, CaseMerge,
     Requirement, RequirementImage,
-    Role, User, SYSTEM_COLUMNS, STATUS_LIST
+    Role, User, SYSTEM_COLUMNS, STATUS_LIST, PRIORITY_DISPLAY_MODES,
+    normalize_case_image_markup,
 )
 
 app = Flask(__name__)
@@ -100,11 +102,18 @@ configure_logging()
 ROLE_READONLY = 0
 ROLE_TEST = 1
 ROLE_ADMIN = 2
+ROLE_DEMO = 3
 ADMIN_ENDPOINTS = {
     'update_project', 'delete_project',
     'update_version', 'delete_version', 'copy_version',
-    'backup_database',
 }
+ADMIN_ONLY_ENDPOINTS = {'list_backups', 'restore_backup'}
+BACKUP_FILE_PREFIX = 'case_manager_backup_'
+BACKUP_FILE_SUFFIX = '.zip'
+BACKUP_INTERVAL_SECONDS = 12 * 60 * 60
+BACKUP_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_backup_scheduler_started = False
+_backup_scheduler_lock = threading.Lock()
 
 
 def normalize_row_height(value, default=36):
@@ -116,16 +125,21 @@ def normalize_row_height(value, default=36):
 
 
 def migrate_auth_schema():
-    """为已有 roles 表补充数据库维护的权限字段。"""
+    """为已有权限、账号和项目表补充数据库维护字段。"""
     with db.engine.begin() as conn:
-        for column, definition in (
-            ('can_write', 'TINYINT(1) NULL DEFAULT NULL'),
-            ('can_manage', 'TINYINT(1) NULL DEFAULT NULL'),
+        for table, column, definition in (
+            ('roles', 'can_write', 'TINYINT(1) NULL DEFAULT NULL'),
+            ('roles', 'can_manage', 'TINYINT(1) NULL DEFAULT NULL'),
+            ('users', 'data_scope', "VARCHAR(100) NOT NULL DEFAULT 'shared'"),
+            ('projects', 'sort_order', 'INT NOT NULL DEFAULT 0'),
+            ('projects', 'data_scope', "VARCHAR(100) NOT NULL DEFAULT 'shared'"),
         ):
             try:
-                conn.execute(text(f'ALTER TABLE roles ADD COLUMN {column} {definition}'))
+                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {definition}'))
             except Exception:
                 pass  # 字段已存在
+        conn.execute(text("UPDATE users SET data_scope = 'shared' WHERE data_scope IS NULL OR data_scope = ''"))
+        conn.execute(text("UPDATE projects SET data_scope = 'shared' WHERE data_scope IS NULL OR data_scope = ''"))
 
 
 def initialize_auth_data():
@@ -141,7 +155,8 @@ def initialize_auth_data():
     role_seeds = (
         (ROLE_READONLY, '只读', '只能查看和导出数据', False, False),
         (ROLE_TEST, '测试', '可以编辑用例和执行结果', True, False),
-        (ROLE_ADMIN, '管理员', '可以管理项目、版本、用例和备份', True, True),
+        (ROLE_ADMIN, '管理员', '可以管理项目、版本、用例和数据恢复', True, True),
+        (ROLE_DEMO, '展示', '可以完整操作独立展示数据', True, True),
     )
     roles = {}
     for status, name, description, can_write, can_manage in role_seeds:
@@ -163,22 +178,183 @@ def initialize_auth_data():
         roles[status] = role
 
     user_seeds = (
-        ('admin', '123456', ROLE_ADMIN),
-        ('test', '123456', ROLE_TEST),
-        ('readonly', '123456', ROLE_READONLY),
+        ('admin', '123456', ROLE_ADMIN, 'shared'),
+        ('test', '123456', ROLE_TEST, 'shared'),
+        ('readonly', '123456', ROLE_READONLY, 'shared'),
+        # luya 是独立的展示/演示账号：拥有完整操作权限，可编辑自己的演示数据，
+        # 但通过 data_scope 与正式账号的数据完全隔离。
+        ('luya', '123456', ROLE_DEMO, 'luya_demo'),
     )
-    for username, password, role_status in user_seeds:
+    for username, password, role_status, data_scope in user_seeds:
         user = User.query.filter_by(username=username).first()
         if not user:
             db.session.add(User(
                 username=username,
                 password_hash=generate_password_hash(password),
                 role_id=roles[role_status].id,
+                data_scope=data_scope,
                 is_active=True,
             ))
+        elif username == 'luya':
+            # 历史版本曾将 luya 初始化为只读账号。每次启动都校正为展示权限，
+            # 避免已有数据库中的旧角色使展示账号仍然无法增删改查。
+            user.role_id = roles[role_status].id
+            user.data_scope = data_scope
         elif not user.role_id:
             user.role_id = roles[role_status].id
     db.session.commit()
+    luya = User.query.filter_by(username='luya', is_active=True).first()
+    if luya and luya.data_scope != 'luya_demo':
+        luya.data_scope = 'luya_demo'
+        db.session.commit()
+    initialize_luya_demo_data()
+
+
+def initialize_luya_demo_data():
+    """为 luya 创建文档系统式的两组可操作示例内容。
+
+    示例按项目拆分，软件项目讲骑行卡和优惠券，硬件项目讲轨迹、CAN
+    模拟和手表。初始化是幂等的：项目或版本被删除后会重新创建；已有
+    用例则不覆盖，避免用户在展示账号中补充的内容被启动流程覆盖。
+    """
+    luya = User.query.filter_by(username='luya', is_active=True).first()
+    if not luya:
+        return
+    scope = luya.data_scope or 'luya_demo'
+    demo_projects = [
+        {
+            'name': '软件功能示例',
+            'description': '以骑行卡、优惠券和订单为例，边写边介绍软件用例的编写与验证方式。',
+            'version': '骑行卡与优惠券',
+            'column_name': '示例说明',
+            'column_key': 'demo_note',
+            'cases': [
+                ('账号与会员', '登录后查看骑行卡权益', '用户已注册并完成登录，账号处于正常状态。', '打开会员中心，进入骑行卡页面，查看当前卡类型、剩余次数和有效期。', '页面展示的信息与后台会员权益一致；未登录用户被引导登录。', '先看前置条件，再按操作步骤逐项验证，最后核对权益数据。', 'P0', '适合演示标题、前置条件、步骤和预期结果如何对应。'),
+                ('骑行卡', '购买月卡并展示权益', '用户已登录，账户余额或支付方式可用，当前没有生效中的同类月卡。', '选择月卡，确认价格和权益，完成支付后返回会员中心。', '支付成功后月卡立即生效，显示有效期、可用次数和使用规则；支付失败不扣除权益。', 'P0', '一条用例只描述一个主流程，支付成功和失败可拆成两条用例。'),
+                ('骑行卡', '月卡到期后不可继续抵扣', '账号存在一张已过期的月卡，仍有历史剩余次数。', '进入骑行下单页，选择车辆并提交订单，观察费用计算。', '过期月卡不再抵扣车费，页面提示月卡已过期，并引导购买新的骑行卡。', 'P1', '通过边界日期准备数据，验证页面展示、费用计算和提示文案。'),
+                ('优惠券', '领取新人优惠券', '新用户已完成注册，活动在有效期内且账号未领取过新人券。', '进入优惠券中心，点击新人优惠券的领取按钮，再刷新页面查看卡券列表。', '领取成功后优惠券出现在“未使用”列表，券面显示门槛、面额和有效期。', 'P1', '刷新后仍能看到数据，说明前端展示和后端保存都正常。'),
+                ('优惠券', '骑行下单自动使用可用优惠券', '账号有一张未过期且满足门槛的骑行优惠券。', '创建满足使用门槛的骑行订单，进入费用确认页，查看优惠券选择和实付金额。', '系统默认选择符合条件的优惠券，优惠金额和实付金额计算准确，订单明细可追溯。', 'P0', '重点检查金额计算、优惠券状态和订单明细三个结果。'),
+                ('优惠券', '订单取消后优惠券恢复可用', '账号有一张可用优惠券，骑行订单已创建但尚未开始。', '使用优惠券创建订单，随后取消订单，再返回优惠券中心查看状态。', '订单取消后优惠券恢复为“未使用”；重复取消不会产生多张优惠券。', 'P1', '这是典型的状态回退场景，适合演示执行结果切换和问题记录。'),
+                ('优惠券', '过期优惠券不可使用', '账号有一张超过有效期的优惠券，券面状态为“已过期”。', '创建骑行订单，在费用确认页打开优惠券列表并尝试选择过期券。', '过期券不可选择，页面明确显示过期原因，实付金额不被错误减免。', 'P1', '同时验证列表状态、交互禁用和最终金额，避免只测到其中一层。'),
+                ('订单与退款', '购买骑行卡退款后权益回收', '用户已成功购买骑行卡，订单处于可退款状态。', '提交退款申请，完成退款，再回到会员中心和订单详情查看状态。', '退款成功后订单状态正确，未使用权益被回收，退款金额与订单记录一致。', 'P2', '退款属于异步流程，建议补充处理中、成功、失败三种结果。'),
+                ('平台使用', '勾选用例后双击打开完整编辑', '当前版本已经显示用例列表，编辑模式已打开。', '勾选一条用例，再双击该用例的标题、备注或其他任意列。', '打开完整编辑窗口，可以同时编辑当前用例显示的全部列；保存后列表内容同步更新。', 'P1', '展示账号可用这个动作快速修改一条完整用例，不需要逐列编辑。'),
+                ('平台使用', '未勾选用例时单击编辑当前单元格', '当前版本已经显示用例列表，编辑模式已打开，且未勾选用例。', '单击任意单元格直接输入；需要大段内容时双击该单元格打开大文本编辑窗口。', '单击只编辑当前行当前列，双击打开当前字段的大文本编辑，不会误打开整行编辑。', 'P1', '这是列表快速编辑方式：选中用例和不选中用例的双击行为不同。'),
+                ('平台使用', '在版本上复制到其他项目', '当前账号有两个项目，编辑模式已打开，源版本中已有完整用例。', '右键版本名称，选择“复制到其他项目”，选择目标项目并输入目标版本名称后确认。', '目标项目新增一份完整版本，包含列配置、用例、执行结果、图片、合并关系和需求记录；源项目保持不变。', 'P1', '跨项目复制针对整个版本，不在用例行上操作，也不会改变源项目的版本排序。'),
+            ],
+        },
+        {
+            'name': '硬件测试示例',
+            'description': '以轨迹、CAN 模拟和手表互联为例，展示软硬件联调类用例的写法。',
+            'version': '轨迹、CAN模拟与手表',
+            'column_name': '示例说明',
+            'column_key': 'demo_note',
+            'cases': [
+                ('轨迹', '骑行过程中轨迹连续记录', '手机定位权限已开启，车辆和账号已绑定，网络连接正常。', '开始骑行，连续行驶一段距离后暂停，再结束骑行并打开轨迹详情。', '轨迹点按时间顺序连续记录，起终点、距离和骑行时间与实际情况基本一致。', 'P0', '轨迹类用例要同时关注地图线、里程、时间和数据落库。'),
+                ('轨迹', 'GPS 弱信号时轨迹自动补点', '进入高楼、隧道等 GPS 信号较弱区域，骑行记录正在进行。', '观察信号变弱、恢复和结束骑行三个阶段的轨迹表现。', '弱信号期间不产生明显异常跳点，信号恢复后轨迹继续记录，最终距离计算合理。', 'P1', '可将实际路线截图粘贴到备注中，作为问题复现的现场依据。'),
+                ('轨迹', '暂停后恢复骑行轨迹不丢失', '骑行已开始并产生轨迹点，设备电量充足。', '点击暂停，等待一段时间后点击继续，结束骑行并查看轨迹。', '暂停期间不累计骑行距离，恢复后继续使用同一条记录，前后轨迹连接正常。', 'P1', '重点检查暂停状态、时间统计和轨迹连接处是否出现断线。'),
+                ('CAN模拟', '模拟车速报文并同步仪表', 'CAN 模拟器已连接，报文周期和信号定义配置正确。', '依次发送 0、10、30、60 km/h 车速报文，观察仪表和平台显示。', '仪表车速按报文实时变化，单位和小数处理正确，停止发送后状态符合设计。', 'P0', '这是 CAN 模拟的基础示例，可在备注中记录报文 ID、周期和信号值。'),
+                ('CAN模拟', '模拟电池电量变化', 'CAN 模拟器已加载电池 SOC 报文，车辆处于上电状态。', '发送 100%、50%、20% 和 0% 的 SOC 数据，观察仪表电量显示和告警。', '电量显示与输入值一致，低电量和亏电告警在阈值处正确触发与恢复。', 'P0', '边界值要单独记录，避免只验证中间值而漏掉阈值问题。'),
+                ('CAN模拟', '异常报文和报文中断处理', '车辆已上电，平台正在接收 CAN 报文。', '发送错误格式、超时以及停止发送报文，观察仪表、日志和告警。', '系统不崩溃，异常被记录并给出明确提示；报文恢复后状态能够恢复。', 'P1', '异常类用例的预期结果应包含保护、记录和恢复三个部分。'),
+                ('手表', '手表首次绑定并同步账号', '手表已充电并进入蓝牙可发现状态，手机已登录目标账号。', '打开设备管理，搜索手表并完成绑定，检查手表端和手机端账号信息。', '绑定成功后设备列表显示手表，双方账号一致，重复绑定有明确提示。', 'P0', '适合演示硬件连接类用例的前置条件和双端验证方式。'),
+                ('手表', '手表显示骑行状态和速度', '手表已绑定，车辆已开始骑行，车机或手机能够提供速度数据。', '开始骑行并改变速度，观察手表端骑行状态、速度和累计时间。', '手表状态及时从待机切换到骑行，速度和时间刷新正常，单位显示一致。', 'P1', '记录手机、车辆和手表三端的观察结果，便于定位同步链路问题。'),
+                ('手表', '蓝牙断开后重新连接并恢复数据', '手表已经绑定并正在同步骑行数据。', '关闭手机蓝牙或离开有效范围，等待断开提示后重新开启蓝牙并回到有效范围。', '断开状态有明确提示；重新连接后设备恢复在线，未同步的数据能够补传且不重复。', 'P1', '这是典型的断连恢复场景，建议配合日志和时间点一起记录。'),
+            ],
+        },
+    ]
+
+    for project_def in demo_projects:
+        project_name = project_def['name']
+        project = Project.query.filter_by(name=project_name, data_scope=scope).first()
+        if not project:
+            # 项目名称是全局唯一的；若正式数据中占用了示例名称，不覆盖正式项目。
+            name_conflict = Project.query.filter_by(name=project_name).first()
+            if name_conflict:
+                app.logger.warning('luya 示例项目名称已被其他数据范围占用：%s', project_name)
+                continue
+            max_order = db.session.query(db.func.max(Project.sort_order)).filter_by(
+                data_scope=scope
+            ).scalar()
+            project = Project(
+                name=project_name,
+                description=project_def['description'],
+                sort_order=(max_order if max_order is not None else -1) + 1,
+                data_scope=scope,
+            )
+            db.session.add(project)
+            db.session.flush()
+
+        version = Version.query.filter_by(
+            project_id=project.id, version_name=project_def['version']
+        ).first()
+        if not version:
+            version = Version(
+                project_id=project.id,
+                version_name=project_def['version'],
+                sort_order=0,
+            )
+            db.session.add(version)
+            db.session.flush()
+        init_system_columns(project.id, version.id)
+
+        custom_column = CustomColumn.query.filter_by(
+            project_id=project.id,
+            version_id=version.id,
+            key=project_def['column_key'],
+        ).first()
+        if not custom_column:
+            max_column_order = db.session.query(db.func.max(CustomColumn.sort_order)).filter_by(
+                project_id=project.id, version_id=version.id
+            ).scalar()
+            custom_column = CustomColumn(
+                project_id=project.id,
+                version_id=version.id,
+                name=project_def['column_name'],
+                key=project_def['column_key'],
+                is_system=False,
+                is_visible=True,
+                width=220,
+                sort_order=(max_column_order if max_column_order is not None else -1) + 1,
+            )
+            db.session.add(custom_column)
+            db.session.commit()
+
+        existing_cases = TestCase.query.filter_by(
+            project_id=project.id, version_id=version.id
+        ).all()
+        existing_titles = {case.title for case in existing_cases}
+        next_case_no = len(existing_cases) + 1
+        max_case_order = max((case.sort_order or 0 for case in existing_cases), default=0)
+        added_count = 0
+        for index, case_data in enumerate(project_def['cases'], start=1):
+            # 新增示例时允许只填写“优先级 + 示例说明”；此时把示例说明
+            # 同步放入备注，登录后可以直接看到边写边讲的内容。
+            if len(case_data) == 7:
+                module, title, precondition, steps, expected, priority, demo_note = case_data
+                remark = demo_note
+            else:
+                module, title, precondition, steps, expected, remark, priority, demo_note = case_data
+            if title in existing_titles:
+                continue
+            added_count += 1
+            case = TestCase(
+                project_id=project.id,
+                version_id=version.id,
+                case_no=str(next_case_no),
+                module=module,
+                title=title,
+                precondition=precondition,
+                steps=steps,
+                expected_result=expected,
+                priority=priority,
+                status='未执行',
+                remark=remark,
+                sort_order=max_case_order + added_count * 1000,
+            )
+            case.set_custom_fields({project_def['column_key']: demo_note})
+            db.session.add(case)
+            next_case_no += 1
+        if added_count:
+            db.session.commit()
 
 
 def current_user():
@@ -193,6 +369,69 @@ def current_user():
     ).first()
 
 
+def current_data_scope(user=None):
+    user = user or current_user()
+    return (user.data_scope if user and user.data_scope else 'shared')
+
+
+def project_is_accessible(project, user=None):
+    return bool(project and project.data_scope == current_data_scope(user))
+
+
+def request_is_outside_data_scope(user):
+    """拦截通过猜 ID 访问其他账号数据的请求，保证隔离不只依赖前端列表。"""
+    scope = current_data_scope(user)
+    args = request.view_args or {}
+    project_ids = []
+    version_ids = []
+    case_ids = []
+    for key in ('project_id',):
+        if args.get(key) is not None:
+            project_ids.append(args[key])
+    if args.get('version_id') is not None:
+        version_ids.append(args['version_id'])
+    if args.get('case_id') is not None:
+        case_ids.append(args['case_id'])
+    if args.get('image_id') is not None:
+        if request.endpoint in {'get_requirement_image_content', 'delete_requirement_image'}:
+            image = db.session.get(RequirementImage, args['image_id'])
+            if image and not project_is_accessible(image.requirement.version.project, user):
+                return True
+        else:
+            image = db.session.get(CaseImage, args['image_id'])
+            if image and not project_is_accessible(image.case.project, user):
+                return True
+    if args.get('requirement_id') is not None:
+        requirement = db.session.get(Requirement, args['requirement_id'])
+        if requirement and not project_is_accessible(requirement.version.project, user):
+            return True
+    if args.get('requirement_image_id') is not None:
+        image = db.session.get(RequirementImage, args['requirement_image_id'])
+        if image and not project_is_accessible(image.requirement.version.project, user):
+            return True
+    payload = request.get_json(silent=True) or {}
+    if isinstance(payload, dict):
+        if payload.get('project_id') is not None:
+            project_ids.append(payload.get('project_id'))
+        if payload.get('version_id') is not None:
+            version_ids.append(payload.get('version_id'))
+        if isinstance(payload.get('case_ids'), list):
+            case_ids.extend(payload.get('case_ids'))
+    for project_id in project_ids:
+        project = db.session.get(Project, project_id)
+        if project and not project_is_accessible(project, user):
+            return True
+    for version_id in version_ids:
+        version = db.session.get(Version, version_id)
+        if version and not project_is_accessible(version.project, user):
+            return True
+    if case_ids:
+        cases = TestCase.query.filter(TestCase.id.in_(case_ids)).all()
+        if any(not project_is_accessible(case.project, user) for case in cases):
+            return True
+    return False
+
+
 @app.before_request
 def require_api_login():
     if not request.path.startswith('/api'):
@@ -204,8 +443,12 @@ def require_api_login():
     user = current_user()
     if not user:
         return jsonify({'success': False, 'message': '请先登录'}), 401
+    if request_is_outside_data_scope(user):
+        return jsonify({'success': False, 'message': '当前账号无权访问该数据'}), 404
     if not user.role.can_write and request.method != 'GET':
         return jsonify({'success': False, 'message': '只读账号不可操作'}), 403
+    if request.endpoint in ADMIN_ONLY_ENDPOINTS and user.role.status != ROLE_ADMIN:
+        return jsonify({'success': False, 'message': '当前账号没有数据备份管理权限'}), 403
     if request.endpoint in ADMIN_ENDPOINTS and not user.role.can_manage:
         return jsonify({'success': False, 'message': '当前账号没有管理员权限'}), 403
     return None
@@ -318,7 +561,9 @@ def logout():
 # ------------------- 项目 -------------------
 @app.route('/api/projects', methods=['GET'])
 def get_projects():
-    projects = Project.query.order_by(Project.created_at.desc()).all()
+    projects = Project.query.filter_by(data_scope=current_data_scope()).order_by(
+        Project.sort_order.asc(), Project.id.asc()
+    ).all()
     return jsonify({'success': True, 'data': [p.to_dict() for p in projects]})
 
 
@@ -331,13 +576,55 @@ def create_project():
     if Project.query.filter_by(name=name).first():
         return jsonify({'success': False, 'message': '项目名称已存在'}), 400
 
-    project = Project(name=name, description=data.get('description', ''))
+    scope = current_data_scope()
+    max_order = db.session.query(db.func.max(Project.sort_order)).filter_by(data_scope=scope).scalar()
+    project = Project(
+        name=name,
+        description=data.get('description', ''),
+        sort_order=(max_order if max_order is not None else -1) + 1,
+        data_scope=scope,
+    )
     db.session.add(project)
     db.session.flush()
 
     db.session.commit()
 
     return jsonify({'success': True, 'data': project.to_dict()})
+
+
+@app.route('/api/projects/order', methods=['POST'])
+def update_project_order():
+    """保存当前账号数据范围内的项目顺序。测试账号和管理员均可使用。"""
+    data = request.json or {}
+    orders = data.get('orders') or {}
+    if not isinstance(orders, dict):
+        return jsonify({'success': False, 'message': '项目排序数据格式错误'}), 400
+    projects = Project.query.filter_by(data_scope=current_data_scope()).all()
+    project_map = {str(project.id): project for project in projects}
+    try:
+        requested = []
+        for project_id, order in orders.items():
+            project = project_map.get(str(project_id))
+            if project is not None:
+                requested.append((int(order), project.id, project))
+        requested.sort(key=lambda item: (item[0], item[1]))
+        ordered_ids = {item[1] for item in requested}
+        remaining = sorted(
+            (project for project in projects if project.id not in ordered_ids),
+            key=lambda project: (project.sort_order or 0, project.id),
+        )
+        for index, (_, _, project) in enumerate(requested):
+            project.sort_order = index
+        for index, project in enumerate(remaining, start=len(requested)):
+            project.sort_order = index
+        db.session.commit()
+    except (TypeError, ValueError):
+        db.session.rollback()
+        return jsonify({'success': False, 'message': '项目排序值无效'}), 400
+    return jsonify({'success': True, 'data': [
+        project.to_dict()
+        for project in sorted(projects, key=lambda item: (item.sort_order, item.id))
+    ]})
 
 
 @app.route('/api/projects/<int:project_id>', methods=['PUT'])
@@ -392,27 +679,34 @@ def create_version(project_id):
 
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/copy', methods=['POST'])
 def copy_version(project_id, version_id):
-    source = Version.query.filter_by(id=version_id, project_id=project_id).first_or_404()
-    init_system_columns(project_id, source.id)
     data = request.json or {}
+    source_project = Project.query.filter_by(
+        id=project_id, data_scope=current_data_scope()
+    ).first_or_404()
+    target_project_id = data.get('target_project_id') or project_id
+    target_project = Project.query.filter_by(
+        id=target_project_id, data_scope=current_data_scope()
+    ).first_or_404()
+    source = Version.query.filter_by(id=version_id, project_id=source_project.id).first_or_404()
+    init_system_columns(source_project.id, source.id)
     name = (data.get('version_name') or '').strip()
     if not name:
         return jsonify({'success': False, 'message': '副本名称不能为空'}), 400
-    if Version.query.filter_by(project_id=project_id, version_name=name).first():
-        return jsonify({'success': False, 'message': '该项目下版本名已存在'}), 400
+    if Version.query.filter_by(project_id=target_project.id, version_name=name).first():
+        return jsonify({'success': False, 'message': '目标项目下版本名已存在'}), 400
 
-    max_order = db.session.query(db.func.max(Version.sort_order)).filter_by(project_id=project_id).scalar()
+    max_order = db.session.query(db.func.max(Version.sort_order)).filter_by(project_id=target_project.id).scalar()
     new_version = Version(
-        project_id=project_id,
+        project_id=target_project.id,
         version_name=name,
         sort_order=(max_order if max_order is not None else -1) + 1
     )
     try:
         db.session.add(new_version)
         db.session.flush()
-        for source_column in query_version_columns(project_id, source.id):
+        for source_column in query_version_columns(source_project.id, source.id):
                 db.session.add(CustomColumn(
-                project_id=project_id,
+                project_id=target_project.id,
                 version_id=new_version.id,
                 name=source_column.name,
                 key=source_column.key,
@@ -420,16 +714,17 @@ def copy_version(project_id, version_id):
                 is_visible=source_column.is_visible,
                     width=source_column.width,
                     sort_order=source_column.sort_order,
-                    text_align=source_column.text_align or 'left',
-                    aggregate_type=source_column.aggregate_type or '',
+                text_align=source_column.text_align or 'left',
+                aggregate_type=source_column.aggregate_type or '',
+                priority_mode=source_column.priority_mode or 'codes',
                 ))
-        source_cases = TestCase.query.filter_by(project_id=project_id, version_id=source.id) \
+        source_cases = TestCase.query.filter_by(project_id=source_project.id, version_id=source.id) \
             .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
         case_id_map = {}
         image_replacements = []
         for source_case in source_cases:
             copied_case = TestCase(
-                project_id=project_id,
+                project_id=target_project.id,
                 version_id=new_version.id,
                 case_no=source_case.case_no,
                 module=source_case.module,
@@ -438,7 +733,7 @@ def copy_version(project_id, version_id):
                 steps=source_case.steps,
                 expected_result=source_case.expected_result,
                 priority=source_case.priority,
-                status=source_case.status,
+                status=status_for_case_title(source_case.title, source_case.status),
                 remark=source_case.remark,
                 custom_fields=source_case.custom_fields,
                 sort_order=source_case.sort_order,
@@ -462,32 +757,27 @@ def copy_version(project_id, version_id):
                 image_replacements.append((copied_case, source_image, copied_image))
 
         db.session.flush()
-        for copied_case, source_image, copied_image in image_replacements:
-            new_src = f'/api/images/{copied_image.id}/content'
-            tag_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+        # 图片可能位于自定义列，不只是备注列；复制版本时统一修正所有字段。
+        for copied_case in [case for case in TestCase.query.filter_by(
+                project_id=target_project.id, version_id=new_version.id).all()]:
+            copied_images = list(copied_case.images or [])
+            fallback_index = [0]
+            for field in ('module', 'title', 'precondition', 'steps',
+                          'expected_result', 'remark'):
+                setattr(copied_case, field, normalize_case_image_markup(
+                    getattr(copied_case, field) or '', copied_images, fallback_index
+                ))
+            custom = copied_case.get_custom_fields()
+            copied_case.set_custom_fields({
+                key: normalize_case_image_markup(value, copied_images, fallback_index)
+                for key, value in custom.items()
+            })
 
-            def replace_image_tag(match, old_id=source_image.id, new_id=copied_image.id, src=new_src):
-                tag = match.group(0)
-                has_id = re.search(r'data-image-id\s*=\s*["\']' + str(old_id) + r'["\']', tag, re.IGNORECASE)
-                if not has_id:
-                    return tag
-                tag = re.sub(
-                    r'(data-image-id\s*=\s*["\'])\d+(["\'])',
-                    lambda m: m.group(1) + str(new_id) + m.group(2), tag, flags=re.IGNORECASE
-                )
-                tag = re.sub(
-                    r'(src\s*=\s*["\'])[^"\']*(["\'])',
-                    lambda m: m.group(1) + src + m.group(2), tag, flags=re.IGNORECASE
-                )
-                return tag
-
-            copied_case.remark = tag_pattern.sub(replace_image_tag, copied_case.remark or '')
-
-        for source_merge in CaseMerge.query.filter_by(project_id=project_id, version_id=source.id).all():
+        for source_merge in CaseMerge.query.filter_by(project_id=source_project.id, version_id=source.id).all():
             copied_ids = [case_id_map[case_id] for case_id in source_merge.get_case_ids() if case_id in case_id_map]
             if len(copied_ids) >= 2:
                 copied_merge = CaseMerge(
-                    project_id=project_id,
+                    project_id=target_project.id,
                     version_id=new_version.id,
                     column_key=source_merge.column_key,
                 )
@@ -495,11 +785,11 @@ def copy_version(project_id, version_id):
                 db.session.add(copied_merge)
 
         source_requirements = Requirement.query.filter_by(
-            project_id=project_id, version_id=source.id
+            project_id=source_project.id, version_id=source.id
         ).order_by(Requirement.sort_order.asc(), Requirement.id.asc()).all()
         for source_requirement in source_requirements:
             copied_requirement = Requirement(
-                project_id=project_id,
+                project_id=target_project.id,
                 version_id=new_version.id,
                 title=source_requirement.title,
                 record_type=source_requirement.record_type,
@@ -843,6 +1133,13 @@ def update_column(column_id):
         if col.is_system and aggregate_type:
             return jsonify({'success': False, 'message': '系统列不能设置为数字求和列'}), 400
         col.aggregate_type = aggregate_type
+    if 'priority_mode' in data:
+        priority_mode = str(data.get('priority_mode') or '').strip().lower()
+        if not (col.is_system and col.key == 'priority'):
+            return jsonify({'success': False, 'message': '只有优先级系统列支持显示方式'}), 400
+        if priority_mode not in PRIORITY_DISPLAY_MODES:
+            return jsonify({'success': False, 'message': '优先级显示方式无效'}), 400
+        col.priority_mode = priority_mode
     db.session.commit()
     return jsonify({'success': True, 'data': col.to_dict()})
 
@@ -1232,7 +1529,11 @@ def get_cases(project_id, version_id):
         'page_size': page_size,
         'columns': columns_dict,
         'cases': [
-            dict(c.to_dict(columns_dict), status=normalize_status(c.status))
+            dict(
+                c.to_dict(columns_dict),
+                status=normalize_status(case_status_value(c)),
+                status_cleared=title_has_strikethrough(c.title),
+            )
             for c in cases
         ],
         'merges': merge_data
@@ -1256,6 +1557,8 @@ def rich_value_to_excel_text(value):
 
 def export_column_value(case, column):
     if column.is_system:
+        if column.key == 'status':
+            return case_status_value(case)
         return getattr(case, column.key, '')
     return (case.get_custom_fields() or {}).get(column.key, '')
 
@@ -1288,26 +1591,19 @@ def add_excel_image_in_cell(worksheet, image_data, row_index, column_index, imag
     worksheet.add_image(embedded)
 
 
-@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/export', methods=['GET'])
-def export_version_excel(project_id, version_id):
-    """导出当前版本的可见列、用例、合并关系和单元格内图片。"""
-    version = Version.query.filter_by(id=version_id, project_id=project_id).first()
-    project = Project.query.get(project_id)
-    if not version or not project:
-        return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
-
-    init_system_columns(project_id, version_id)
-    columns = [column for column in query_version_columns(project_id, version_id)
-               if column.is_visible]
-    cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id) \
-        .order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
-    merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version_id).all()
-
-    workbook = Workbook()
-    sheet_title = export_sheet_title(version.version_name)
-    if sheet_title == '图片附件':
-        sheet_title = '用例列表'
-    worksheet = workbook.active
+def append_version_worksheet(workbook, version, columns, cases, merges, worksheet=None):
+    """将一个版本写入工作簿，供单版本和整项目导出共用。"""
+    worksheet = worksheet or workbook.create_sheet()
+    base_title = export_sheet_title(version.version_name)
+    if base_title == '图片附件':
+        base_title = '用例列表'
+    used_titles = {sheet.title for sheet in workbook.worksheets if sheet is not worksheet}
+    sheet_title = base_title
+    suffix = 2
+    while sheet_title in used_titles:
+        suffix_text = f'_{suffix}'
+        sheet_title = f'{base_title[:31 - len(suffix_text)]}{suffix_text}'
+        suffix += 1
     worksheet.title = sheet_title
     worksheet.freeze_panes = 'A2'
     worksheet.sheet_view.showGridLines = False
@@ -1323,11 +1619,8 @@ def export_version_excel(project_id, version_id):
         bottom=Side(style='thin', color='D9E2F3'),
     )
     status_colors = {
-        '通过': '67C23A',
-        '失败': 'F56C6C',
-        '未执行': '909399',
-        '阻塞': 'E6A23C',
-        '跳过': '409EFF',
+        '通过': '67C23A', '失败': 'F56C6C', '未执行': '909399',
+        '阻塞': 'E6A23C', '跳过': '409EFF',
     }
 
     for column_index, column in enumerate(columns, start=1):
@@ -1336,7 +1629,6 @@ def export_version_excel(project_id, version_id):
         header.font = header_font
         header.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         header.border = border
-        # Web 端宽度是像素，Excel 列宽使用近似字符数。
         worksheet.column_dimensions[get_column_letter(column_index)].width = max(
             10, min(60, round((column.width or 120) / 7, 1))
         )
@@ -1348,38 +1640,38 @@ def export_version_excel(project_id, version_id):
     for row_index, case in enumerate(cases, start=2):
         case_row_map[case.id] = row_index
         images = [image for image in case.images if image.image_data]
-        has_image = bool(images)
         for column_index, column in enumerate(columns, start=1):
             raw_value = export_column_value(case, column)
             cell_value = rich_value_to_excel_text(raw_value)
-            if column.key == 'remark' and has_image:
-                # 图片直接锚定在备注单元格中，不再输出占位文字或附件工作表提示。
+            if column.key == 'remark' and images:
                 cell_value = re.sub(r'\[图片\]', '', cell_value).strip()
             cell = worksheet.cell(row=row_index, column=column_index, value=cell_value)
             cell.border = border
             horizontal = column.text_align if column.text_align in {'left', 'center', 'right'} else 'left'
             cell.alignment = Alignment(horizontal=horizontal, vertical='top', wrap_text=True)
-            cell.font = strike_font if re.search(r'<(?:s|strike|del)\b', str(raw_value or ''), re.IGNORECASE) else body_font
+            cell.font = strike_font if re.search(
+                r'<(?:s|strike|del)\b', str(raw_value or ''), re.IGNORECASE
+            ) else body_font
             if column.key == 'status':
                 cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                status = normalize_status(raw_value)
-                cell.font = Font(name='Microsoft YaHei', size=10, color=status_colors.get(status, '1F2937'))
-        # openpyxl 使用磅，前端保存的是像素；图片较多时自动保证图片不会被行高裁切。
+                cell.font = Font(
+                    name='Microsoft YaHei', size=10,
+                    color=status_colors.get(normalize_status(raw_value), '1F2937'),
+                )
         saved_height = max(24, min(360, int(case.row_height or 36))) * 0.75
         image_height = 78 * ((len(images) + 1) // 2) if images else 0
         worksheet.row_dimensions[row_index].height = max(18, min(270, max(saved_height, image_height)))
         if image_column_index:
             for image_index, image in enumerate(images):
                 try:
-                    add_excel_image_in_cell(worksheet, image.image_data, row_index, image_column_index, image_index)
+                    add_excel_image_in_cell(
+                        worksheet, image.image_data, row_index, image_column_index, image_index
+                    )
                 except Exception:
-                    # 单张图片损坏时不影响其他用例导出。
                     continue
 
     if cases and columns:
         worksheet.auto_filter.ref = f'A1:{get_column_letter(len(columns))}{len(cases) + 1}'
-
-    # 将当前版本的纵向合并关系还原到导出表格，隐藏列对应的合并自然跳过。
     for merge in merges:
         if merge.column_key == 'case_no':
             continue
@@ -1391,22 +1683,84 @@ def export_version_excel(project_id, version_id):
         if sorted(rows) != list(range(start_row, end_row + 1)):
             continue
         worksheet.merge_cells(
-            start_row=start_row,
-            start_column=column_index,
-            end_row=end_row,
-            end_column=column_index,
+            start_row=start_row, start_column=column_index,
+            end_row=end_row, end_column=column_index,
         )
-        merged_cell = worksheet.cell(row=start_row, column=column_index)
-        merged_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        worksheet.cell(row=start_row, column=column_index).alignment = Alignment(
+            horizontal='center', vertical='center', wrap_text=True
+        )
+    return worksheet
 
+
+def make_version_export_workbook(version, case_ids=None):
+    init_system_columns(version.project_id, version.id)
+    columns = [column for column in query_version_columns(version.project_id, version.id) if column.is_visible]
+    query = TestCase.query.filter_by(project_id=version.project_id, version_id=version.id)
+    if case_ids is not None:
+        query = query.filter(TestCase.id.in_(case_ids))
+    cases = query.order_by(TestCase.sort_order.asc(), TestCase.id.asc()).all()
+    merges = CaseMerge.query.filter_by(project_id=version.project_id, version_id=version.id).all()
+    workbook = Workbook()
+    append_version_worksheet(workbook, version, columns, cases, merges, workbook.active)
+    return workbook, len(cases)
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/export', methods=['GET'])
+def export_version_excel(project_id, version_id):
+    """导出当前版本，可通过 case_ids 只导出勾选的用例。"""
+    version = Version.query.filter_by(id=version_id, project_id=project_id).first()
+    project = db.session.get(Project, project_id)
+    if not version or not project:
+        return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
+    raw_ids = request.args.get('case_ids', '').strip()
+    case_ids = None
+    if raw_ids:
+        try:
+            case_ids = list(dict.fromkeys(int(value) for value in raw_ids.split(',') if value.strip()))
+        except ValueError:
+            return jsonify({'success': False, 'message': '用例选择参数无效'}), 400
+    workbook, case_count = make_version_export_workbook(version, case_ids)
     output = io.BytesIO()
     workbook.save(output)
     output.seek(0)
-    download_name = f'{project.name}_{version.version_name}_用例.xlsx'
+    suffix = '选中用例' if case_ids is not None else '用例'
     return send_file(
         output,
         as_attachment=True,
-        download_name=download_name,
+        download_name=f'{project.name}_{version.version_name}_{suffix}.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+
+
+@app.route('/api/projects/<int:project_id>/export', methods=['GET'])
+def export_project_excel(project_id):
+    """将当前账号可见项目的全部版本导出到一个 Excel 工作簿。"""
+    project = db.session.get(Project, project_id)
+    if not project:
+        return jsonify({'success': False, 'message': '项目不存在'}), 404
+    versions = Version.query.filter_by(project_id=project_id).order_by(
+        Version.sort_order.asc(), Version.id.asc()
+    ).all()
+    workbook = Workbook()
+    if versions:
+        for index, version in enumerate(versions):
+            init_system_columns(project_id, version.id)
+            columns = [column for column in query_version_columns(project_id, version.id) if column.is_visible]
+            cases = TestCase.query.filter_by(project_id=project_id, version_id=version.id).order_by(
+                TestCase.sort_order.asc(), TestCase.id.asc()
+            ).all()
+            merges = CaseMerge.query.filter_by(project_id=project_id, version_id=version.id).all()
+            sheet = workbook.active if index == 0 else workbook.create_sheet()
+            append_version_worksheet(workbook, version, columns, cases, merges, sheet)
+    else:
+        workbook.active.title = '项目用例'
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=f'{project.name}_全部用例.xlsx',
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     )
 
@@ -1431,9 +1785,38 @@ def reset_case_status(project_id, version_id):
         return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
     cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
     for case in cases:
-        case.status = '未执行'
+        case.status = '' if title_has_strikethrough(case.title) else '未执行'
     db.session.commit()
     return jsonify({'success': True, 'data': {'reset': len(cases)}})
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/columns/<int:column_id>/clear', methods=['POST'])
+def clear_case_column(project_id, version_id, column_id):
+    """清空当前项目当前版本中指定列的内容。"""
+    version = Version.query.filter_by(id=version_id, project_id=project_id).first()
+    if not version:
+        return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
+    column = CustomColumn.query.filter_by(
+        id=column_id, project_id=project_id, version_id=version_id
+    ).first()
+    if not column:
+        return jsonify({'success': False, 'message': '当前版本的列不存在'}), 404
+    if column.key == 'case_no':
+        return jsonify({'success': False, 'message': '用例编号请使用“重置编号”功能'}), 400
+    if column.key == 'status':
+        return jsonify({'success': False, 'message': '执行结果请使用“重置测试结果”功能'}), 400
+
+    cases = TestCase.query.filter_by(project_id=project_id, version_id=version_id).all()
+    for case in cases:
+        if column.is_system:
+            setattr(case, column.key, '')
+        else:
+            custom = case.get_custom_fields()
+            if column.key in custom:
+                custom[column.key] = ''
+                case.set_custom_fields(custom)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'cleared': len(cases), 'column_id': column.id}})
 
 
 @app.route('/api/cases', methods=['POST'])
@@ -1448,22 +1831,24 @@ def create_case():
     if not case_no:
         case_no = str(next_case_number(project_id, version_id))
 
+    title = data.get('title', '')
+    requested_status = data.get('status', '未执行')
     case = TestCase(
         project_id=project_id,
         version_id=version_id,
         case_no=case_no,
         module=data.get('module', ''),
-        title=data.get('title', ''),
+        title=title,
         precondition=data.get('precondition', ''),
         steps=data.get('steps', ''),
         expected_result=data.get('expected_result', ''),
         priority=data.get('priority', ''),
-        status=data.get('status', '未执行'),
+        status='' if title_has_strikethrough(title) else requested_status,
         remark=data.get('remark', ''),
         row_height=normalize_row_height(data.get('row_height')),
         sort_order=compute_sort_orders(project_id, version_id, count=1)[0]
     )
-    if case.status not in STATUS_LIST:
+    if case.status and case.status not in STATUS_LIST:
         case.status = '未执行'
 
     custom = data.get('custom_fields', {})
@@ -1516,22 +1901,24 @@ def create_cases_batch():
         if not case_no:
             case_no = str(next_number)
             next_number += 1
+        title = item.get('title', '')
+        requested_status = item.get('status', '未执行')
         case = TestCase(
             project_id=project_id,
             version_id=version_id,
             case_no=case_no,
             module=item.get('module', ''),
-            title=item.get('title', ''),
+            title=title,
             precondition=item.get('precondition', ''),
             steps=item.get('steps', ''),
             expected_result=item.get('expected_result', ''),
             priority=item.get('priority', ''),
-            status=item.get('status', '未执行'),
+            status='' if title_has_strikethrough(title) else requested_status,
             remark=item.get('remark', ''),
             row_height=normalize_row_height(item.get('row_height')),
             sort_order=sort_orders[i]
         )
-        if case.status not in STATUS_LIST:
+        if case.status and case.status not in STATUS_LIST:
             case.status = '未执行'
         custom = item.get('custom_fields', {})
         if not isinstance(custom, dict):
@@ -1596,6 +1983,7 @@ def create_cases_batch():
 def update_case(case_id):
     case = TestCase.query.get_or_404(case_id)
     data = request.json or {}
+    was_title_struck = title_has_strikethrough(case.title)
     if 'case_no' in data:
         case_no = excel_value_to_text(data.get('case_no'))
         case.case_no = case_no or str(next_case_number(case.project_id, case.version_id))
@@ -1605,8 +1993,15 @@ def update_case(case_id):
     case.steps = data.get('steps', case.steps)
     case.expected_result = data.get('expected_result', case.expected_result)
     case.priority = data.get('priority', case.priority)
-    if 'status' in data and data['status'] in STATUS_LIST:
+    if title_has_strikethrough(case.title):
+        # 标题删除线代表该用例暂时不参与执行，直接移除执行结果；
+        # 列表、筛选、总结和导出都会按空状态处理。
+        clear_title_group_status(case)
+    elif 'status' in data and data['status'] in STATUS_LIST:
         case.status = data['status']
+    elif was_title_struck:
+        # 取消删除线后没有同步提交执行结果时，恢复为可执行的未执行状态。
+        case.status = '未执行'
     case.remark = data.get('remark', case.remark)
     if 'row_height' in data:
         case.row_height = normalize_row_height(data.get('row_height'))
@@ -1668,6 +2063,209 @@ def delete_cases_batch():
         normalize_case_order(project_id, version_id, reset_numbers=True)
     db.session.commit()
     return jsonify({'success': True, 'data': {'deleted': len(cases)}})
+
+
+def _merge_runs_for_case_order(member_ids, ordered_ids):
+    """按新的用例顺序拆分合并范围，避免移动部分行后扩大合并区域。"""
+    member_set = set(member_ids)
+    runs = []
+    current = []
+    for case_id in ordered_ids:
+        if case_id in member_set:
+            current.append(case_id)
+        elif current:
+            if len(current) >= 2:
+                runs.append(current)
+            current = []
+    if len(current) >= 2:
+        runs.append(current)
+    return runs
+
+
+def _rebuild_merges_for_case_order(project_id, version_id, ordered_cases):
+    """根据最终行顺序重建受剪切/复制影响的连续合并关系。"""
+    ordered_ids = [case.id for case in ordered_cases]
+    merges = CaseMerge.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    for merge in merges:
+        runs = _merge_runs_for_case_order(merge.get_case_ids(), ordered_ids)
+        if not runs:
+            db.session.delete(merge)
+            continue
+        merge.set_case_ids(runs[0])
+        for run in runs[1:]:
+            db.session.add(CaseMerge(
+                project_id=project_id,
+                version_id=version_id,
+                column_key=merge.column_key,
+                case_ids=json.dumps(run, ensure_ascii=False),
+            ))
+
+
+@app.route('/api/projects/<int:project_id>/versions/<int:version_id>/cases/clipboard', methods=['POST'])
+def clipboard_cases(project_id, version_id):
+    """在当前版本中复制或剪切多条用例，并粘贴到指定首列行之前。"""
+    data = request.json or {}
+    action = str(data.get('action') or '').strip().lower()
+    if action not in {'copy', 'cut'}:
+        return jsonify({'success': False, 'message': '用例操作类型无效'}), 400
+
+    raw_ids = data.get('case_ids') or []
+    if not isinstance(raw_ids, list):
+        return jsonify({'success': False, 'message': '用例编号格式错误'}), 400
+    try:
+        case_ids = list(dict.fromkeys(int(case_id) for case_id in raw_ids))
+        target_id = int(data.get('target_case_id'))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': '请先选择用例和粘贴目标行'}), 400
+    if not case_ids:
+        return jsonify({'success': False, 'message': '请先选择要操作的用例'}), 400
+
+    target = TestCase.query.filter_by(
+        id=target_id, project_id=project_id, version_id=version_id
+    ).first()
+    if not target:
+        return jsonify({'success': False, 'message': '粘贴目标行不存在或不属于当前版本'}), 404
+
+    ordered_cases = TestCase.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+    ordered_cases.sort(key=_case_display_sort_key)
+    source_by_id = {case.id: case for case in ordered_cases}
+    if any(case_id not in source_by_id for case_id in case_ids):
+        return jsonify({'success': False, 'message': '只能操作当前版本中的用例'}), 400
+    if target_id in case_ids:
+        return jsonify({'success': False, 'message': '粘贴目标行不能是选中的用例'}), 400
+
+    requested_ids = set(case_ids)
+    selected_cases = [source_by_id[case.id] for case in ordered_cases if case.id in requested_ids]
+    selected_set = {case.id for case in selected_cases}
+    source_merges = CaseMerge.query.filter_by(
+        project_id=project_id, version_id=version_id
+    ).all()
+
+    # 剪切直接复用原对象；复制则连同自定义字段、行高、执行结果和图片创建新对象。
+    pasted_cases = list(selected_cases)
+    copied_merge_specs = []
+    if action == 'copy':
+        case_id_map = {}
+        image_replacements = []
+        pasted_cases = []
+        for source_case in selected_cases:
+            copied_case = TestCase(
+                project_id=project_id,
+                version_id=version_id,
+                case_no=source_case.case_no,
+                module=source_case.module,
+                title=source_case.title,
+                precondition=source_case.precondition,
+                steps=source_case.steps,
+                expected_result=source_case.expected_result,
+                priority=source_case.priority,
+                status=source_case.status,
+                remark=source_case.remark,
+                custom_fields=source_case.custom_fields,
+                row_height=source_case.row_height or 36,
+                sort_order=0,
+            )
+            db.session.add(copied_case)
+            db.session.flush()
+            case_id_map[source_case.id] = copied_case.id
+            pasted_cases.append(copied_case)
+            for source_image in source_case.images:
+                copied_image = CaseImage(
+                    test_case_id=copied_case.id,
+                    filename=source_image.filename,
+                    file_path=source_image.file_path or '',
+                    image_data=bytes(source_image.image_data) if source_image.image_data else None,
+                    mime_type=source_image.mime_type,
+                )
+                db.session.add(copied_image)
+                image_replacements.append((copied_case, source_image.id, copied_image))
+
+        db.session.flush()
+        image_tag_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+        for copied_case, source_image_id, copied_image in image_replacements:
+            new_src = f'/api/images/{copied_image.id}/content'
+
+            def replace_image_tag(match, old_id=source_image_id,
+                                   new_id=copied_image.id, src=new_src):
+                tag = match.group(0)
+                if not re.search(
+                        r'data-image-id\s*=\s*["\']' + str(old_id) + r'["\']',
+                        tag, re.IGNORECASE):
+                    return tag
+                tag = re.sub(
+                    r'(data-image-id\s*=\s*["\'])\d+(["\'])',
+                    lambda item: item.group(1) + str(new_id) + item.group(2),
+                    tag, flags=re.IGNORECASE,
+                )
+                return re.sub(
+                    r'(src\s*=\s*["\'])[^"\']*(["\'])',
+                    lambda item: item.group(1) + src + item.group(2),
+                    tag, flags=re.IGNORECASE,
+                )
+
+            for field in ('module', 'title', 'precondition', 'steps',
+                          'expected_result', 'remark'):
+                value = getattr(copied_case, field) or ''
+                setattr(copied_case, field, image_tag_pattern.sub(replace_image_tag, value))
+            custom = copied_case.get_custom_fields()
+            for key, value in custom.items():
+                if isinstance(value, str):
+                    custom[key] = image_tag_pattern.sub(replace_image_tag, value)
+            copied_case.set_custom_fields(custom)
+
+        # 只有完整选中一个合并组时才复制该合并关系，部分选中不强行合并。
+        for source_merge in source_merges:
+            member_ids = source_merge.get_case_ids()
+            if source_merge.column_key == 'case_no' or len(member_ids) < 2:
+                continue
+            if set(member_ids).issubset(selected_set):
+                copied_merge_specs.append((
+                    source_merge.column_key,
+                    [case_id_map[case_id] for case_id in member_ids],
+                ))
+
+    remaining_cases = (
+        [case for case in ordered_cases if case.id not in selected_set]
+        if action == 'cut' else list(ordered_cases)
+    )
+    target_index = next(
+        (index for index, case in enumerate(remaining_cases) if case.id == target_id),
+        None,
+    )
+    if target_index is None:
+        return jsonify({'success': False, 'message': '无法确定粘贴目标位置'}), 400
+    final_cases = (
+        remaining_cases[:target_index] + pasted_cases + remaining_cases[target_index:]
+    )
+
+    db.session.flush()
+    for index, case in enumerate(final_cases, start=1):
+        case.sort_order = index * 1000
+    for column_key, copied_ids in copied_merge_specs:
+        db.session.add(CaseMerge(
+            project_id=project_id,
+            version_id=version_id,
+            column_key=column_key,
+            case_ids=json.dumps(copied_ids, ensure_ascii=False),
+        ))
+    db.session.flush()
+    _rebuild_merges_for_case_order(project_id, version_id, final_cases)
+    normalize_case_order(project_id, version_id, reset_numbers=True)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'action': action,
+            'count': len(pasted_cases),
+            'target_case_id': target_id,
+            'case_ids': [case.id for case in pasted_cases],
+        },
+    })
 
 
 # ------------------- 统计 -------------------
@@ -1790,7 +2388,7 @@ def get_stats(project_id, version_id):
     stats = {}
     for status in STATUS_LIST:
         # 与用例列表筛选及页面展示保持一致：历史数据中的空值也属于“未执行”。
-        count = sum(1 for case in logical_cases if normalize_status(case.status) == status)
+        count = sum(1 for case in logical_cases if normalize_status(case_status_value(case)) == status)
         stats[status] = {
             'count': count,
             'percent': round(count / total * 100, 1) if total else 0
@@ -1819,6 +2417,123 @@ def summary_text(value):
     return value.strip()
 
 
+def title_has_strikethrough(value):
+    """判断标题的全部可见内容是否都带删除线。
+
+    编辑器可能保存为 ``<s>``/``<strike>``/``<del>``，也可能保存为
+    ``style="text-decoration: line-through"``。只有所有非空文本都处于
+    删除线节点或删除线样式继承范围内，才移除执行结果；标题只划掉一部分
+    时返回 False，避免误清除原有状态。
+    """
+    raw = str(value or '')
+    if not raw.strip():
+        return False
+
+    class _StrikeCoverageParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.strike_depth = 0
+            self.has_content = False
+            self.has_struck_content = False
+            self.has_unstruck_content = False
+            self.tag_stack = []
+
+        @staticmethod
+        def is_strike_tag(tag, attrs):
+            if tag.lower() in {'s', 'strike', 'del'}:
+                return True
+            style = next((value or '' for name, value in attrs if name.lower() == 'style'), '')
+            return bool(re.search(
+                r'text-decoration(?:-line)?\s*:\s*[^;]*line-through',
+                style,
+                flags=re.IGNORECASE,
+            ))
+
+        def handle_starttag(self, tag, attrs):
+            tag_name = tag.lower()
+            is_strike = self.is_strike_tag(tag_name, attrs)
+            self.tag_stack.append((tag_name, is_strike))
+            if is_strike:
+                self.strike_depth += 1
+
+        def handle_startendtag(self, tag, attrs):
+            # 标题一般不含图片；若含图片，也只有在删除线范围内才算覆盖。
+            if tag.lower() == 'img':
+                self.has_content = True
+                if self.strike_depth == 0:
+                    self.has_unstruck_content = True
+                else:
+                    self.has_struck_content = True
+
+        def handle_endtag(self, tag):
+            tag_name = tag.lower()
+            for index in range(len(self.tag_stack) - 1, -1, -1):
+                if self.tag_stack[index][0] != tag_name:
+                    continue
+                removed = self.tag_stack[index:]
+                del self.tag_stack[index:]
+                self.strike_depth = max(
+                    0,
+                    self.strike_depth - sum(1 for _, is_strike in removed if is_strike),
+                )
+                break
+
+        def handle_data(self, data):
+            if not data.replace('\xa0', ' ').strip():
+                return
+            self.has_content = True
+            if self.strike_depth == 0:
+                self.has_unstruck_content = True
+            else:
+                self.has_struck_content = True
+
+    parser = _StrikeCoverageParser()
+    try:
+        parser.feed(raw)
+        parser.close()
+    except Exception:
+        # 解析不确定时不清除状态，优先保护历史执行结果。
+        return False
+    return parser.has_content and parser.has_struck_content and not parser.has_unstruck_content
+
+
+def status_for_case_title(title, status):
+    """标题带删除线时，执行结果按空状态处理。"""
+    return '' if title_has_strikethrough(title) else (status or '')
+
+
+def case_status_value(case):
+    """读取用例的有效执行结果，不让删除线标题继续带出旧状态。"""
+    return status_for_case_title(case.title, case.status)
+
+
+def clear_title_group_status(case):
+    """标题跨行合并时，删除线作用于整条逻辑用例的执行结果。"""
+    related_ids = {case.id}
+    for merge in CaseMerge.query.filter_by(
+        project_id=case.project_id,
+        version_id=case.version_id,
+        column_key='title',
+    ).all():
+        member_ids = set(merge.get_case_ids())
+        if case.id in member_ids:
+            related_ids.update(member_ids)
+    if len(related_ids) == 1:
+        case.status = ''
+        return
+    for member in TestCase.query.filter(
+        TestCase.project_id == case.project_id,
+        TestCase.version_id == case.version_id,
+        TestCase.id.in_(related_ids),
+    ).all():
+        member.status = ''
+
+
+def summary_group_is_excluded(group):
+    """标题列任一合并成员有删除线时，整条逻辑用例不参与总结。"""
+    return any(title_has_strikethrough(member.title) for member in group)
+
+
 def summary_column_value(case, column):
     if column.is_system:
         return getattr(case, column.key, '')
@@ -1841,6 +2556,8 @@ def build_summary_data(project_id, version_id, field_key='remark'):
     logical_groups = [group for group in logical_case_groups(
         project_id, version_id, all_cases
     ) if group]
+    excluded_groups = [group for group in logical_groups if summary_group_is_excluded(group)]
+    logical_groups = [group for group in logical_groups if not summary_group_is_excluded(group)]
     logical_cases = [group[0] for group in logical_groups]
     total = len(logical_cases)
     counts = {status: sum(1 for case in logical_cases if normalize_status(case.status) == status)
@@ -1878,6 +2595,7 @@ def build_summary_data(project_id, version_id, field_key='remark'):
     ]
     return {
         'total': total,
+        'excluded_strikethrough': len(excluded_groups),
         'completed': completed,
         'completed_percent': completed_percent,
         # 保留旧字段，避免已有页面或外部调用出现兼容问题。
@@ -1923,7 +2641,7 @@ def summary_export_html(project, version, data, show_images):
             if show_images:
                 image_tags = []
                 for image in item.get('images', []):
-                    record = CaseImage.query.get(image['id'])
+                    record = db.session.get(CaseImage, image['id'])
                     if not record or not record.image_data:
                         continue
                     encoded = base64.b64encode(bytes(record.image_data)).decode('ascii')
@@ -1948,6 +2666,10 @@ def summary_export_html(project, version, data, show_images):
         for title, items in sections
     )
     image_note = '显示图片' if show_images else '不显示图片'
+    excluded_note = (
+        f"　|　已排除标题带删除线的 {data.get('excluded_strikethrough', 0)} 条用例"
+        if data.get('excluded_strikethrough') else ''
+    )
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(project.name)} / {html.escape(version.version_name)} 执行总结</title>
 <style>
@@ -1962,7 +2684,7 @@ li{{margin:8px 0}} .summary-reason{{color:#f56c6c}} .empty{{color:#909399}} .sum
 @media(max-width:760px){{.cards{{grid-template-columns:repeat(3,1fr)}}}}
 </style></head><body><main class="page">
 <h1>{html.escape(project.name)} / {html.escape(version.version_name)} 执行总结</h1>
-<div class="meta">总结字段：{html.escape(data['summary_field_name'] or '备注')}　|　{image_note}</div>
+<div class="meta">总结字段：{html.escape(data['summary_field_name'] or '备注')}　|　{image_note}{excluded_note}</div>
 <div class="cards"><div class="card"><div class="num">{data['total']}</div>总用例</div>
 <div class="card"><div class="num">{data['completed']}</div>完成</div><div class="card completion"><div class="num">{data['completed_percent']}%</div>完成率</div><div class="card"><div class="num">{data['unexecuted']}</div>未执行</div>
 <div class="card"><div class="num">{data['success']}</div>通过</div><div class="card"><div class="num">{data['fail']}</div>失败</div><div class="card"><div class="num">{data['block']}</div>阻塞</div><div class="card"><div class="num">{data['skip']}</div>跳过</div></div>
@@ -2042,7 +2764,11 @@ def render_summary_png(project, version, data, show_images):
     y += 48
     field_name = data.get('summary_field_name') or '备注'
     image_note = '显示图片' if show_images else '不显示图片'
-    draw.text((margin, y), f'总结字段：{field_name}  |  {image_note}', font=meta_font, fill=muted_color)
+    excluded_note = (
+        f"  |  已排除标题带删除线的 {data.get('excluded_strikethrough', 0)} 条用例"
+        if data.get('excluded_strikethrough') else ''
+    )
+    draw.text((margin, y), f'总结字段：{field_name}  |  {image_note}{excluded_note}', font=meta_font, fill=muted_color)
     y += 38
 
     cards = [
@@ -2101,7 +2827,7 @@ def render_summary_png(project, version, data, show_images):
             y = max(reason_y, y + 26) + 8
             if show_images:
                 for image_info in item.get('images') or []:
-                    record = CaseImage.query.get(image_info.get('id'))
+                    record = db.session.get(CaseImage, image_info.get('id'))
                     if not record or not record.image_data:
                         continue
                     try:
@@ -2124,7 +2850,7 @@ def render_summary_png(project, version, data, show_images):
 
 @app.route('/api/projects/<int:project_id>/versions/<int:version_id>/summary/export', methods=['GET'])
 def export_summary(project_id, version_id):
-    project = Project.query.get(project_id)
+    project = db.session.get(Project, project_id)
     version = Version.query.filter_by(id=version_id, project_id=project_id).first()
     if not project or not version:
         return jsonify({'success': False, 'message': '项目或版本不存在'}), 404
@@ -2418,6 +3144,9 @@ def import_cases(project_id, version_id):
     file = request.files.get('file')
     if not file:
         return jsonify({'success': False, 'message': '未上传文件'}), 400
+    import_position = (request.form.get('import_position') or 'bottom').strip().lower()
+    if import_position not in {'top', 'bottom'}:
+        return jsonify({'success': False, 'message': '导入位置只能选择顶部或底部'}), 400
 
     wb = None
     legacy_book = None
@@ -2570,17 +3299,22 @@ def import_cases(project_id, version_id):
                 continue
             data_rows.append((excel_row_number, values))
 
-        # 普通导入是追加导入：已有用例保留在原位置，新数据从当前列表末尾继续排列。
-        # 这样同一版本可以分批导入多个 Excel，不会把后续批次插到最前面。
+        # 追加导入默认放在底部，也可以由用户选择放在顶部。两种方式都
+        # 通过 sort_order 插入，不直接改动已有用例的业务字段和合并关系。
         existing_cases = TestCase.query.filter_by(
             project_id=project_id, version_id=version_id
         ).all()
         existing_cases.sort(key=_case_display_sort_key)
-        append_target_id = existing_cases[-1].id if existing_cases else None
+        if import_position == 'top':
+            insert_target_id = existing_cases[0].id if existing_cases else None
+            insert_position = 'above' if insert_target_id else None
+        else:
+            insert_target_id = existing_cases[-1].id if existing_cases else None
+            insert_position = 'below' if insert_target_id else None
         sort_orders = compute_sort_orders(
             project_id, version_id,
-            target_id=append_target_id,
-            position='below' if append_target_id else None,
+            target_id=insert_target_id,
+            position=insert_position,
             count=len(data_rows)
         ) if data_rows else []
         imported_case_ids_by_row = {}
@@ -2598,7 +3332,10 @@ def import_cases(project_id, version_id):
                         row[idx], preserve_strike=system_key not in {'status'}
                     ) if idx < len(row) else ''
 
-            status = normalize_status(values_by_system_key.get('status', '未执行'))
+            title = values_by_system_key.get('title', '')
+            status = '' if title_has_strikethrough(title) else normalize_status(
+                values_by_system_key.get('status', '未执行')
+            )
 
             case = TestCase(
                 project_id=project_id,
@@ -2606,7 +3343,7 @@ def import_cases(project_id, version_id):
                 # 表格未填写编号时按导入顺序自动生成 1、2、3……；已有数据则从最大数字继续。
                 case_no=values_by_system_key.get('case_no') or str(next_number),
                 module=values_by_system_key.get('module', ''),
-                title=values_by_system_key.get('title', ''),
+                title=title,
                 precondition=values_by_system_key.get('precondition', ''),
                 steps=values_by_system_key.get('steps', ''),
                 expected_result=values_by_system_key.get('expected_result', ''),
@@ -2755,55 +3492,284 @@ def serve_image_content(image_id):
     return jsonify({'success': False, 'message': '图片内容不存在'}), 404
 
 
-# ------------------- 数据库备份 -------------------
-@app.route('/api/backup', methods=['POST'])
-def backup_database():
-    data = request.json or {}
-    backup_dir = data.get('backup_dir', config.BACKUP_DIR)
-    try:
-        os.makedirs(backup_dir, exist_ok=True)
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'无法创建备份目录: {str(e)}'}), 400
+# ------------------- 定时全量备份与回滚 -------------------
+def _backup_json_value(value):
+    """将 MySQL 返回值转换成可逆的 JSON 值，尤其保留图片 BLOB。"""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {'__type__': 'bytes', 'value': base64.b64encode(bytes(value)).decode('ascii')}
+    if isinstance(value, datetime):
+        return {'__type__': 'datetime', 'value': value.isoformat(sep=' ')}
+    if isinstance(value, date):
+        return {'__type__': 'date', 'value': value.isoformat()}
+    if isinstance(value, datetime_time):
+        return {'__type__': 'time', 'value': value.isoformat()}
+    if isinstance(value, Decimal):
+        return {'__type__': 'decimal', 'value': str(value)}
+    return value
 
+
+def _restore_json_value(value):
+    """恢复全量备份中的特殊值，保证日期、数字和图片可以重新写回 MySQL。"""
+    if not isinstance(value, dict) or '__type__' not in value:
+        return value
+    value_type = value.get('__type__')
+    raw = value.get('value')
+    if value_type == 'bytes':
+        return base64.b64decode(raw or '')
+    if value_type == 'datetime':
+        return datetime.fromisoformat(raw)
+    if value_type == 'date':
+        return date.fromisoformat(raw)
+    if value_type == 'time':
+        return datetime_time.fromisoformat(raw)
+    if value_type == 'decimal':
+        return Decimal(raw)
+    raise ValueError(f'备份中存在未知数据类型：{value_type}')
+
+
+def _quote_mysql_identifier(identifier):
+    """安全引用备份中的表名/字段名；名称来自 SHOW TABLES/备份自身。"""
+    return '`' + str(identifier).replace('`', '``') + '`'
+
+
+def cleanup_old_backups(backup_dir=None):
+    """只删除本程序生成且超过七天的 ZIP 备份，不触碰其他文件。"""
+    backup_dir = backup_dir or config.BACKUP_DIR
+    os.makedirs(backup_dir, exist_ok=True)
+    deadline = time.time() - BACKUP_RETENTION_SECONDS
+    deleted = 0
+    for entry in os.scandir(backup_dir):
+        if not entry.is_file() or not entry.name.startswith(BACKUP_FILE_PREFIX) or not entry.name.endswith(BACKUP_FILE_SUFFIX):
+            continue
+        try:
+            if entry.stat().st_mtime < deadline:
+                os.remove(entry.path)
+                deleted += 1
+        except OSError as exc:
+            app.logger.warning('删除过期备份失败 %s：%s', entry.path, exc)
+    if deleted:
+        app.logger.info('已清理 %s 个七天前的数据库备份', deleted)
+    return deleted
+
+
+def create_full_database_backup(reason='scheduled'):
+    """把当前数据库的所有表、所有字段和图片 BLOB 打包到一个 ZIP。
+
+    该函数只执行 SELECT/SHOW 和文件写入，不执行 INSERT、UPDATE、DELETE，
+    因此定时备份不会改变业务数据库。先写临时文件，完成后原子替换，避免
+    页面看到半成品备份。
+    """
+    backup_dir = config.BACKUP_DIR
+    os.makedirs(backup_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"case_manager_backup_{timestamp}.sql"
+    filename = f'{BACKUP_FILE_PREFIX}{timestamp}{BACKUP_FILE_SUFFIX}'
+    collision_index = 1
+    while os.path.exists(os.path.join(backup_dir, filename)):
+        filename = f'{BACKUP_FILE_PREFIX}{timestamp}_{collision_index}{BACKUP_FILE_SUFFIX}'
+        collision_index += 1
     filepath = os.path.join(backup_dir, filename)
+    temp_path = filepath + '.tmp'
+    tables = {}
+    schema_sql = []
+    row_count = 0
+    image_count = 0
 
-    # 优先使用 mysqldump
-    mysqldump = shutil.which('mysqldump')
-    if mysqldump:
-        cmd = [
-            mysqldump,
-            '-h', config.DB_HOST,
-            '-P', str(config.DB_PORT),
-            '-u', config.DB_USER,
-            f'--password={config.DB_PASSWORD}',
-            '--single-transaction',
-            '--routines',
-            '--triggers',
-            config.DB_NAME
-        ]
+    # 使用独立连接读取全库，避免 ORM 关系序列化时遗漏图片或自定义列。
+    with db.engine.connect() as conn:
+        table_rows = conn.exec_driver_sql('SHOW TABLES').fetchall()
+        table_names = [row[0] for row in table_rows]
+        for table_name in table_names:
+            quoted_table = _quote_mysql_identifier(table_name)
+            create_row = conn.exec_driver_sql(
+                f'SHOW CREATE TABLE {quoted_table}'
+            ).first()
+            if create_row is not None and len(create_row) > 1:
+                schema_sql.append(str(create_row[1]).rstrip(';') + ';')
+            rows = conn.exec_driver_sql(
+                f'SELECT * FROM {quoted_table}'
+            ).mappings().all()
+            serialized_rows = []
+            for row in rows:
+                serialized = {key: _backup_json_value(value) for key, value in row.items()}
+                serialized_rows.append(serialized)
+                row_count += 1
+                if table_name in {'case_images', 'requirement_images'} and serialized.get('image_data'):
+                    image_count += 1
+            tables[table_name] = serialized_rows
+
+    created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    manifest = {
+        'format': 'case-manager-full-backup',
+        'format_version': 1,
+        'created_at': created_at,
+        'reason': reason,
+        'database': config.DB_NAME,
+        'table_count': len(tables),
+        'row_count': row_count,
+        'image_count': image_count,
+    }
+    payload = {'manifest': manifest, 'tables': tables}
+    try:
+        with ZipFile(temp_path, 'w', compression=ZIP_DEFLATED, compresslevel=6) as archive:
+            archive.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+            archive.writestr('database.json', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            archive.writestr('schema.sql', '\n\n'.join(schema_sql) + '\n')
+        os.replace(temp_path, filepath)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    app.logger.info(
+        '数据库全量备份完成：%s，表 %s 个，数据行 %s 行，图片 %s 张，原因：%s',
+        filepath, len(tables), row_count, image_count, reason,
+    )
+    return filepath, manifest
+
+
+def list_full_database_backups():
+    """读取备份清单供管理页面展示，损坏文件也明确标记而不直接隐藏。"""
+    os.makedirs(config.BACKUP_DIR, exist_ok=True)
+    result = []
+    for entry in os.scandir(config.BACKUP_DIR):
+        if not entry.is_file() or not entry.name.startswith(BACKUP_FILE_PREFIX) or not entry.name.endswith(BACKUP_FILE_SUFFIX):
+            continue
+        item = {
+            'filename': entry.name,
+            'size': entry.stat().st_size,
+            'created_at': datetime.fromtimestamp(entry.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+            'valid': False,
+        }
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                subprocess.run(cmd, stdout=f, check=True)
-            return jsonify({'success': True, 'data': {'path': filepath}})
-        except subprocess.CalledProcessError as e:
-            return jsonify({'success': False, 'message': f'mysqldump 失败: {str(e)}'}), 500
-    else:
-        # 降级：导出核心表为 JSON
+            with ZipFile(entry.path, 'r') as archive:
+                manifest = json.loads(archive.read('manifest.json').decode('utf-8'))
+            item.update({
+                'created_at': manifest.get('created_at') or item['created_at'],
+                'reason': manifest.get('reason', 'scheduled'),
+                'table_count': manifest.get('table_count', 0),
+                'row_count': manifest.get('row_count', 0),
+                'image_count': manifest.get('image_count', 0),
+                'valid': manifest.get('format') == 'case-manager-full-backup',
+            })
+        except Exception as exc:
+            item['error'] = str(exc)
+        result.append(item)
+    result.sort(key=lambda item: item.get('created_at', ''), reverse=True)
+    return result
+
+
+def _resolve_backup_path(filename):
+    """限制回滚目标只能是 Data_Backup 下本程序生成的 ZIP 文件。"""
+    if not filename or secure_filename(filename) != filename:
+        raise ValueError('备份文件名不合法')
+    if not filename.startswith(BACKUP_FILE_PREFIX) or not filename.endswith(BACKUP_FILE_SUFFIX):
+        raise ValueError('只能回滚系统生成的全量备份')
+    backup_dir = os.path.realpath(config.BACKUP_DIR)
+    path = os.path.realpath(os.path.join(backup_dir, filename))
+    if os.path.commonpath([backup_dir, path]) != backup_dir or not os.path.isfile(path):
+        raise FileNotFoundError('备份文件不存在')
+    return path
+
+
+def restore_full_database_backup(filepath):
+    """恢复全量备份；恢复前由接口自动生成当前数据的保护性备份。"""
+    with ZipFile(filepath, 'r') as archive:
+        manifest = json.loads(archive.read('manifest.json').decode('utf-8'))
+        if manifest.get('format') != 'case-manager-full-backup' or manifest.get('format_version') != 1:
+            raise ValueError('不支持的备份格式')
+        payload = json.loads(archive.read('database.json').decode('utf-8'))
+    backup_tables = payload.get('tables') or {}
+    if not backup_tables:
+        raise ValueError('备份中没有数据库表数据')
+
+    with db.engine.begin() as conn:
+        current_tables = [row[0] for row in conn.exec_driver_sql('SHOW TABLES').fetchall()]
+        unknown_tables = set(backup_tables) - set(current_tables)
+        if unknown_tables:
+            raise ValueError('当前数据库缺少备份中的表：' + '、'.join(sorted(unknown_tables)))
+        conn.exec_driver_sql('SET FOREIGN_KEY_CHECKS=0')
         try:
-            import_data = {
-                'projects': [p.to_dict() for p in Project.query.all()],
-                'versions': [v.to_dict() for v in Version.query.all()],
-                'columns': [c.to_dict() for c in CustomColumn.query.all()],
-                'cases': [c.to_dict() for c in TestCase.query.all()],
-                'merges': [m.to_dict() for m in CaseMerge.query.all()],
-            }
-            with open(filepath.replace('.sql', '.json'), 'w', encoding='utf-8') as f:
-                json.dump(import_data, f, ensure_ascii=False, indent=2)
-            return jsonify({'success': True, 'data': {'path': filepath.replace('.sql', '.json'), 'note': '未找到 mysqldump，已导出为 JSON'}})
-        except Exception as e:
-            return jsonify({'success': False, 'message': f'备份失败: {str(e)}'}), 500
+            # 使用 DELETE 而不是 TRUNCATE，尽量让同一事务可以回滚；备份保留
+            # 自增主键原值，恢复后图片引用和用例关系不会改变。
+            for table_name in current_tables:
+                conn.exec_driver_sql(f'DELETE FROM {_quote_mysql_identifier(table_name)}')
+            for table_name, rows in backup_tables.items():
+                if not rows:
+                    continue
+                columns = list(rows[0].keys())
+                quoted_columns = ','.join(_quote_mysql_identifier(column) for column in columns)
+                bind_names = ','.join(f':v{index}' for index in range(len(columns)))
+                statement = text(
+                    f'INSERT INTO {_quote_mysql_identifier(table_name)} ({quoted_columns}) VALUES ({bind_names})'
+                )
+                values = [
+                    {f'v{index}': _restore_json_value(row.get(column)) for index, column in enumerate(columns)}
+                    for row in rows
+                ]
+                conn.execute(statement, values)
+        finally:
+            conn.exec_driver_sql('SET FOREIGN_KEY_CHECKS=1')
+    db.session.remove()
+    app.logger.warning('已从全量备份恢复数据库：%s', filepath)
+    return manifest
+
+
+@app.route('/api/admin/backups', methods=['GET'])
+def list_backups():
+    cleanup_old_backups()
+    return jsonify({'success': True, 'data': list_full_database_backups()})
+
+
+@app.route('/api/admin/backups/<string:filename>/restore', methods=['POST'])
+def restore_backup(filename):
+    data = request.get_json(silent=True) or {}
+    if data.get('password') != config.DELETE_PASSWORD:
+        return jsonify({'success': False, 'message': '密码错误，无法回滚备份'}), 403
+    try:
+        source_path = _resolve_backup_path(filename)
+        current_path, current_manifest = create_full_database_backup(reason='restore_safety')
+        restore_manifest = restore_full_database_backup(source_path)
+        return jsonify({
+            'success': True,
+            'data': {
+                'restored': restore_manifest,
+                'safety_backup': os.path.basename(current_path),
+                'safety_backup_created_at': current_manifest.get('created_at'),
+            },
+        })
+    except (BadZipFile, KeyError, ValueError, FileNotFoundError) as exc:
+        app.logger.exception('回滚备份失败')
+        return jsonify({'success': False, 'message': f'回滚失败：{exc}'}), 400
+    except Exception as exc:
+        app.logger.exception('回滚备份发生未预期错误')
+        return jsonify({'success': False, 'message': f'回滚失败：{exc}'}), 500
+
+
+def _backup_scheduler_loop():
+    """后台定时线程：每 12 小时备份一次，并清理七天前的备份。"""
+    while True:
+        time.sleep(BACKUP_INTERVAL_SECONDS)
+        try:
+            with app.app_context():
+                cleanup_old_backups()
+                create_full_database_backup(reason='scheduled')
+        except Exception:
+            app.logger.exception('定时全量备份失败')
+
+
+def start_backup_scheduler():
+    """启动单例守护线程，避免 Flask 调试重载重复创建定时器。"""
+    global _backup_scheduler_started
+    with _backup_scheduler_lock:
+        if _backup_scheduler_started:
+            return
+        _backup_scheduler_started = True
+        scheduler = threading.Thread(
+            target=_backup_scheduler_loop,
+            name='case-manager-backup-scheduler',
+            daemon=True,
+        )
+        scheduler.start()
+        app.logger.info('定时全量备份已启动：间隔 12 小时，保留 7 天，目录：%s', config.BACKUP_DIR)
 
 
 # ------------------- 初始化 -------------------
@@ -2839,6 +3805,11 @@ def migrate_sort_order():
                 pass  # 字段已存在
             conn.execute(text("UPDATE custom_columns SET aggregate_type = '' WHERE aggregate_type IS NULL"))
             try:
+                conn.execute(text("ALTER TABLE custom_columns ADD COLUMN priority_mode VARCHAR(20) NOT NULL DEFAULT 'codes'"))
+            except Exception:
+                pass  # 字段已存在
+            conn.execute(text("UPDATE custom_columns SET priority_mode = 'codes' WHERE priority_mode IS NULL OR priority_mode = ''"))
+            try:
                 conn.execute(text("ALTER TABLE test_cases ADD COLUMN sort_order INT DEFAULT 0"))
             except Exception:
                 pass  # 字段已存在
@@ -2852,6 +3823,12 @@ def migrate_sort_order():
             try:
                 conn.execute(text("ALTER TABLE versions ADD COLUMN sort_order INT DEFAULT 0"))
                 version_sort_added = True
+            except Exception:
+                pass  # 字段已存在
+            project_sort_added = False
+            try:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN sort_order INT NOT NULL DEFAULT 0"))
+                project_sort_added = True
             except Exception:
                 pass  # 字段已存在
             # 新上传图片保存为 MySQL LONGBLOB。
@@ -2870,6 +3847,13 @@ def migrate_sort_order():
                 )).fetchall()
                 for offset, row in enumerate(rows):
                     conn.execute(text("UPDATE versions SET sort_order = :sort_order WHERE id = :id"),
+                                 {'sort_order': offset, 'id': row[0]})
+            if project_sort_added:
+                rows = conn.execute(text(
+                    "SELECT id FROM projects ORDER BY created_at DESC, id DESC"
+                )).fetchall()
+                for offset, row in enumerate(rows):
+                    conn.execute(text("UPDATE projects SET sort_order = :sort_order WHERE id = :id"),
                                  {'sort_order': offset, 'id': row[0]})
             conn.commit()
     except Exception as e:
@@ -2959,6 +3943,9 @@ def migrate_version_columns():
     except Exception as exc:
         db.session.rollback()
         app.logger.warning('version_columns 迁移提示: %s', exc)
+
+
+start_backup_scheduler()
 
 
 if __name__ == '__main__':

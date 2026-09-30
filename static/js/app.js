@@ -1,12 +1,18 @@
 const INITIAL_FORMAT={color:'#303133',fontSize:14,bold:false,italic:false,underline:false,strike:false,textAlign:'left'};
-let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],cases:[],merges:[],page:1,pageSize:100,total:0,keyword:'',statusFilters:[],summaryFieldKey:'remark',summaryShowImages:false,columnTotals:{},columnUnits:{},editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,sidebarCollapsed:false,quickAddRow:false,actionsCollapsed:true,currentUser:null,quickInsertTarget:null,quickInsertCount:1,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false,formatRowCaseId:null,formatPainterStyle:null,formatPainterSource:null,formatToolbarInteraction:false,defaultFormats:{},defaultFormat:{...INITIAL_FORMAT},quickFormatColor:'#f56c6c',casesLoadSerial:0,statsLoadSerial:0,requirements:[],requirementScope:null,editingRequirement:null,requirementCreating:false,requirementPendingFiles:[]};
+let state={projects:[],currentProject:null,currentVersion:null,versions:{},expandedProjects:new Set(),columns:[],pendingColumnWidths:{},pendingColumnWidthSaves:{},cases:[],merges:[],page:1,pageSize:100,total:0,keyword:'',statusFilters:[],summaryFieldKey:'remark',summaryShowImages:false,columnTotals:{},columnUnits:{},editingCase:null,editingCell:null,inlineEditing:null,editMode:false,mergeMode:false,mergeAnchor:null,selectedMerge:null,sidebarCollapsed:false,quickAddRow:false,actionsCollapsed:true,currentUser:null,quickInsertTarget:null,quickInsertCount:1,caseClipboard:null,casePasteTargetId:null,caseClipboardBusy:false,pendingImages:[],pendingEmbeddedImages:[],caseImages:[],caseModalUploadedImageIds:[],caseModalSaving:false,formatRowCaseId:null,formatPainterStyle:null,formatPainterSource:null,formatToolbarInteraction:false,defaultFormats:{},defaultFormat:{...INITIAL_FORMAT},quickFormatColor:'#f56c6c',casesLoadSerial:0,statsLoadSerial:0,requirements:[],requirementScope:null,editingRequirement:null,requirementCreating:false,requirementPendingFiles:[],backupPage:false,backups:[],selectedBackup:null};
 let draggedVersion=null;
+let draggedProject=null;
 let versionJustDragged=false;
 let pendingCellClick=null;
 const recentPasteByTarget=new WeakMap();
 const STATUS_LIST=['通过','失败','未执行','阻塞','跳过'];
 const STATUS_COLORS={'通过':'#67c23a','失败':'#f56c6c','未执行':'#909399','阻塞':'#e6a23c','跳过':'#409eff'};
+const PRIORITY_OPTIONS={codes:['P0','P1','P2','P3'],levels:['重要','高','中','低']};
+const PRIORITY_CODE_BY_VALUE={P0:'P0',P1:'P1',P2:'P2',P3:'P3','重要':'P0','高':'P1','中':'P2','低':'P3'};
+const PRIORITY_LEVEL_BY_CODE={P0:'重要',P1:'高',P2:'中',P3:'低'};
 const STATUS_ALIASES={'pass':'通过','passed':'通过','success':'通过','成功':'通过','fail':'失败','failed':'失败','failure':'失败','not run':'未执行','notrun':'未执行','pending':'未执行','blocked':'阻塞','block':'阻塞','skip':'跳过','skipped':'跳过'};
+const VIEW_ANCHOR_STORAGE_KEY='case-manager-view-anchor-v1';
+let viewAnchorSaveTimer=null;
 function $(s){return document.querySelector(s);}
 function $$(s){return document.querySelectorAll(s);}
 function escapeHtml(value){return (value??'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
@@ -30,6 +36,79 @@ function formatScopeKey(){
   return `${state.currentProject.id}:${state.currentVersion.id}`;
 }
 
+function viewAnchorStorageKey(){
+  const username=state.currentUser?.username||'anonymous';
+  return `${VIEW_ANCHOR_STORAGE_KEY}:${location.origin}:${username}`;
+}
+
+function readSavedViewAnchor(){
+  try{
+    const raw=localStorage.getItem(viewAnchorStorageKey());
+    if(!raw)return null;
+    const saved=JSON.parse(raw);
+    if(!saved||!Number.isInteger(Number(saved.projectId))||!Number.isInteger(Number(saved.versionId)))return null;
+    return saved;
+  }catch(err){
+    console.warn('读取项目版本锚点失败',err);
+    return null;
+  }
+}
+
+function getVisibleAnchorCaseId(wrapper,preferredCaseId=null){
+  if(preferredCaseId!==null&&preferredCaseId!==undefined){
+    const preferred=wrapper.querySelector(`tbody tr[data-case-id="${Number(preferredCaseId)}"]`);
+    if(preferred)return Number(preferred.dataset.caseId);
+  }
+  const rect=wrapper.getBoundingClientRect();
+  const targetTop=rect.top+8;
+  const row=Array.from(wrapper.querySelectorAll('tbody tr[data-case-id]')).find(item=>{
+    const rowRect=item.getBoundingClientRect();
+    return rowRect.bottom>targetTop;
+  });
+  return row?Number(row.dataset.caseId):null;
+}
+
+function saveViewAnchor(preferredCaseId=null){
+  if(!state.currentUser||!state.currentProject||!state.currentVersion)return;
+  const wrapper=$('#table-wrapper');
+  if(!wrapper)return;
+  const caseId=getVisibleAnchorCaseId(wrapper,preferredCaseId);
+  const currentCase=caseId?state.cases.find(item=>Number(item.id)===caseId):null;
+  const payload={
+    projectId:Number(state.currentProject.id),
+    versionId:Number(state.currentVersion.id),
+    page:Number(state.page)||1,
+    pageSize:Number(state.pageSize)||100,
+    keyword:state.keyword||'',
+    statusFilters:Array.isArray(state.statusFilters)?state.statusFilters:[],
+    caseId,
+    caseNo:currentCase?.case_no||'',
+    scrollTop:wrapper.scrollTop||0,
+    scrollLeft:wrapper.scrollLeft||0,
+    savedAt:Date.now(),
+  };
+  try{localStorage.setItem(viewAnchorStorageKey(),JSON.stringify(payload));}
+  catch(err){console.warn('保存项目版本锚点失败',err);}
+}
+
+function scheduleSaveViewAnchor(preferredCaseId=null){
+  clearTimeout(viewAnchorSaveTimer);
+  viewAnchorSaveTimer=setTimeout(()=>saveViewAnchor(preferredCaseId),180);
+}
+
+function restoreViewAnchor(saved){
+  if(!saved||Number(saved.projectId)!==Number(state.currentProject?.id)||Number(saved.versionId)!==Number(state.currentVersion?.id))return;
+  const wrapper=$('#table-wrapper');
+  if(!wrapper)return;
+  requestAnimationFrame(()=>{
+    const target=saved.caseId?wrapper.querySelector(`tbody tr[data-case-id="${Number(saved.caseId)}"]`):null;
+    if(target)wrapper.scrollTop=Math.max(0,target.offsetTop-12);
+    else wrapper.scrollTop=Math.max(0,Number(saved.scrollTop)||0);
+    wrapper.scrollLeft=Math.max(0,Number(saved.scrollLeft)||0);
+    scheduleSaveViewAnchor(saved.caseId||null);
+  });
+}
+
 function activateFormatScope(){
   const key=formatScopeKey();
   if(!key){state.defaultFormat={...INITIAL_FORMAT};return state.defaultFormat;}
@@ -40,7 +119,29 @@ function activateFormatScope(){
 
 function toggleStatusFilter(){
   const container=$('#status-filter');
-  if(container)container.classList.toggle('open');
+  if(!container)return;
+  container.classList.toggle('open');
+  if(container.classList.contains('open')){
+    // 下拉层使用 fixed 定位，避开工具栏横向滚动容器的 overflow 裁剪。
+    requestAnimationFrame(positionStatusFilterOptions);
+  }
+}
+function positionStatusFilterOptions(){
+  const container=$('#status-filter');
+  const trigger=$('#status-filter-trigger');
+  const options=container?.querySelector('.status-filter-options');
+  if(!container?.classList.contains('open')||!trigger||!options)return;
+  const triggerRect=trigger.getBoundingClientRect();
+  const optionsWidth=Math.max(150,options.getBoundingClientRect().width||150);
+  const optionsHeight=options.getBoundingClientRect().height||0;
+  const left=Math.min(Math.max(8,triggerRect.right-optionsWidth),window.innerWidth-optionsWidth-8);
+  const belowTop=triggerRect.bottom+4;
+  const aboveTop=triggerRect.top-optionsHeight-4;
+  const top=belowTop+optionsHeight<=window.innerHeight-8||aboveTop<8
+    ?Math.max(8,belowTop)
+    :aboveTop;
+  options.style.left=`${left}px`;
+  options.style.top=`${top}px`;
 }
 function onStatusFilterChange(){
   state.statusFilters=Array.from(document.querySelectorAll('input[name="status-filter-option"]:checked')).map(input=>input.value);
@@ -118,17 +219,18 @@ async function doLogin(){
 function applyRoleUI(){
   const isAdmin=state.currentUser?.can_manage===true;
   const isReadonly=state.currentUser?.can_write!==true;
+  const isScopedAdmin=isAdmin&&state.currentUser?.data_scope&&state.currentUser.data_scope!=='shared';
   const roleHint=$('#current-user-role');
   if(roleHint){
     const user=state.currentUser||{};
     const roleName=user.role_name||'未识别角色';
-    const permission=isAdmin?'可管理项目、版本、用例和备份':isReadonly?'仅可查看和导出':'可编辑用例和执行结果';
+    const permission=isScopedAdmin?'可管理独立展示数据':isAdmin?'可管理项目、版本、用例和数据恢复':isReadonly?'仅可查看和导出':'可编辑用例和执行结果';
     roleHint.textContent=`当前账号：${user.username||''}｜${roleName}｜${permission}`;
     roleHint.className=`account-role-hint ${isAdmin?'role-admin':isReadonly?'role-readonly':'role-test'}`;
   }
-  $$('.admin-only').forEach(el=>el.style.display=isAdmin?'inline-flex':'none');
-  ['btn-add-project','btn-add-version','btn-quick-add','btn-add-case','btn-batch-delete',
-   'btn-merge-cells','btn-unmerge-cells','btn-import','btn-columns','edit-mode-toggle']
+  $$('.admin-only').forEach(el=>el.style.display=isAdmin&&!isScopedAdmin?'inline-flex':'none');
+  ['btn-add-project','btn-add-version','btn-quick-add','btn-batch-delete',
+   'btn-merge-cells','btn-import','btn-columns','edit-mode-toggle']
     .forEach(id=>{const el=$(`#${id}`);if(el)el.disabled=isReadonly;});
   if(isReadonly){
     state.editMode=false;
@@ -141,18 +243,22 @@ $('#login-form').addEventListener('submit',e=>{e.preventDefault();doLogin();});
 async function initApp(){
   await loadProjects();
   if(state.projects.length){
-    // 登录后优先进入第一个有版本的项目，避免最新创建的空项目
-    // 让用户误以为当前账号没有数据；项目和版本数据仍按账号权限从接口读取。
+    const savedView=readSavedViewAnchor();
+    // 登录后优先恢复浏览器未清除的项目、版本和用例锚点；
+    // 锚点不存在或目标已被删除时，回退到第一个有版本的项目。
     let selectedProject=null;
     for(const project of state.projects){
       await loadVersionsForProject(project.id);
       if(!selectedProject&&(state.versions[project.id]||[]).length)selectedProject=project;
     }
-    const p=selectedProject||state.projects[0];
+    const savedProject=state.projects.find(project=>Number(project.id)===Number(savedView?.projectId));
+    const p=savedProject||selectedProject||state.projects[0];
     state.expandedProjects.add(p.id);state.currentProject=p;renderProjects();
     $('#current-project-name').textContent=p.name;
-    const firstVersion=(state.versions[p.id]||[])[0];
-    if(firstVersion)await selectVersion(firstVersion.id,p.id);
+    const versions=state.versions[p.id]||[];
+    const savedVersion=versions.find(version=>Number(version.id)===Number(savedView?.versionId));
+    const firstVersion=savedVersion||versions[0];
+    if(firstVersion)await selectVersion(firstVersion.id,p.id,savedVersion?savedView:null);
   }else{renderProjects();}
 }
 
@@ -166,9 +272,12 @@ function renderProjects(){
   state.projects.forEach(p=>{
     const expanded=state.expandedProjects.has(p.id);
     const canManage=state.editMode&&state.currentUser?.can_manage===true;
+    const canReorder=state.editMode&&state.currentUser?.can_write===true;
     const node=document.createElement('div');node.className='project-node';
+    node.dataset.projectId=p.id;
+    if(canReorder)node.classList.add('project-sortable');
     node.innerHTML=`<div class="project-header ${state.currentProject?.id===p.id?'active':''}" onclick="toggleProject(${p.id})">
-      <span class="project-arrow ${expanded?'expanded':''}">▶</span>
+      ${canReorder?'<span class="project-drag-handle" title="拖动项目排序">⋮⋮</span>':''}<span class="project-arrow ${expanded?'expanded':''}">▶</span>
       <span class="project-name" title="${escapeHtml(p.name)}" data-full-name="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
       ${canManage?`<div class="project-actions">
         <button class="secondary" onclick="event.stopPropagation();editProject(${p.id})">编辑</button>
@@ -177,6 +286,28 @@ function renderProjects(){
     </div><div class="version-list ${expanded?'expanded':''}"></div>`;
     list.appendChild(node);
     bindProjectNameTooltip(node.querySelector('.project-name'));
+    node.addEventListener('dragover',e=>{
+      if(!canReorder||!draggedProject||draggedProject===node)return;
+      e.preventDefault();e.stopPropagation();
+      const rect=node.getBoundingClientRect();
+      if(e.clientY<rect.top+rect.height/2)list.insertBefore(draggedProject,node);
+      else list.insertBefore(draggedProject,node.nextSibling);
+      e.dataTransfer.dropEffect='move';
+    });
+    if(canReorder){
+      node.draggable=true;
+      node.addEventListener('dragstart',e=>{
+        if(e.target.closest('.version-item'))return;
+        draggedProject=node;node.classList.add('dragging');
+        e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',String(p.id));
+        e.stopPropagation();
+      });
+      node.addEventListener('dragend',async e=>{
+        if(draggedProject!==node)return;
+        e.stopPropagation();node.classList.remove('dragging');draggedProject=null;
+        await saveProjectOrder(list);
+      });
+    }
     const vList=node.querySelector('.version-list');
     const versions=state.versions[p.id]||[];
     if(expanded){
@@ -240,15 +371,36 @@ async function saveVersionOrder(projectId,list){
   }
 }
 
+async function saveProjectOrder(list){
+  const orders={};
+  Array.from(list.querySelectorAll(':scope > .project-node')).forEach((item,index)=>{
+    orders[item.dataset.projectId]=index;
+  });
+  try{
+    const res=await api('/api/projects/order',{method:'POST',body:JSON.stringify({orders})});
+    state.projects=res.data||state.projects;
+    renderProjects();
+    showToast('项目排序已保存');
+  }catch(err){
+    await loadProjects();renderProjects();showToast(err.message,'error');
+  }
+}
+
 async function toggleProject(id){
   const project=state.projects.find(p=>p.id===id);
   if(!project)return;
   const switchingProject=state.currentProject?.id!==id;
+  if(switchingProject&&state.quickAddRow){
+    const saved=await saveQuickRows({silent:true});
+    if(!saved)return;
+  }
+  if(switchingProject)saveViewAnchor();
   if(switchingProject){
     state.currentProject=project;
     state.currentVersion=null;
     state.columns=[];state.cases=[];state.merges=[];state.total=0;state.page=1;
-    state.quickAddRow=false;state.quickInsertTarget=null;state.mergeMode=false;state.mergeAnchor=null;
+    state.caseClipboard=null;state.casePasteTargetId=null;
+    state.quickAddRow=false;state.quickInsertTarget=null;state.mergeMode=false;state.mergeAnchor=null;state.selectedMerge=null;
     $('#current-version-name').textContent='';
     $('#stats-bar').innerHTML='<span>共 0 条</span>';
     renderTable();renderPagination();
@@ -261,20 +413,42 @@ async function loadVersionsForProject(projectId){
   const res=await api(`/api/projects/${projectId}/versions`);state.versions[projectId]=res.data||[];
 }
 
-async function selectVersion(id,projectId=null){
+async function selectVersion(id,projectId=null,restoreState=null){
+  if(state.quickAddRow){
+    const saved=await saveQuickRows({silent:true});
+    if(!saved)return;
+  }
+  saveViewAnchor();
   const targetProjectId=projectId??state.currentProject?.id;
   const project=state.projects.find(item=>item.id===targetProjectId);
   if(!project)return;
   state.currentProject=project;
+  state.caseClipboard=null;state.casePasteTargetId=null;
   const versions=state.versions[targetProjectId]||[];
   // 版本 ID 在全库唯一，但请求必须同时使用它所属的项目 ID，防止
   // 切换项目过程中残留旧项目状态，生成 /projects/A/versions/B 的错误地址。
   state.currentVersion=versions.find(v=>Number(v.id)===Number(id)&&Number(v.project_id)===Number(targetProjectId));
   activateFormatScope();
-  state.page=1;state.pageSize=100;state.statusFilters=[];state.summaryFieldKey='remark';state.summaryShowImages=false;state.columnTotals={};state.columnUnits={};state.columns=[];updateStatusFilterUI();
+  const canRestore=restoreState
+    &&Number(restoreState.projectId)===Number(targetProjectId)
+    &&Number(restoreState.versionId)===Number(id);
+  const validPageSizes=[20,50,100,200,300];
+  state.page=canRestore?Math.max(1,Number(restoreState.page)||1):1;
+  state.pageSize=canRestore&&validPageSizes.includes(Number(restoreState.pageSize))?Number(restoreState.pageSize):100;
+  state.keyword=canRestore?String(restoreState.keyword||''):'';
+  state.statusFilters=canRestore&&Array.isArray(restoreState.statusFilters)?restoreState.statusFilters.filter(value=>STATUS_LIST.includes(value)):[];
+  state.summaryFieldKey='remark';state.summaryShowImages=false;state.columnTotals={};state.columnUnits={};state.columns=[];
+  state.mergeMode=false;state.mergeAnchor=null;state.selectedMerge=null;
+  const searchInput=$('#search-input');if(searchInput)searchInput.value=state.keyword;
+  updateStatusFilterUI();
   if(!state.currentVersion)return;
   renderCurrentVersionName();
   await Promise.all([loadColumns(),loadCases(),loadStats()]);
+  if(canRestore&&state.total){
+    const totalPages=Math.max(1,Math.ceil(state.total/state.pageSize));
+    if(state.page>totalPages){state.page=totalPages;await loadCases();}
+    restoreViewAnchor(restoreState);
+  }
   renderProjects();
   $('#current-project-name').textContent=project.name;
   renderCurrentVersionName();
@@ -283,27 +457,64 @@ async function selectVersion(id,projectId=null){
 function showVersionContextMenu(event,projectId,versionId){
   removeContextMenu();removeVersionContextMenu();
   const menu=document.createElement('div');menu.id='version-context-menu';menu.className='context-menu';
-  menu.style.left=event.pageX+'px';menu.style.top=event.pageY+'px';
   const canManage=state.currentUser?.can_manage===true;
-  menu.innerHTML=`<div data-action="create-requirement">创建需求记录</div>${canManage?'<div data-action="copy-version">创建版本副本</div>':''}`;
+  menu.innerHTML=`<div data-action="create-requirement">创建需求记录</div>${canManage?'<div data-action="copy-version">创建版本副本</div><div data-action="copy-version-project">复制版本到其他项目</div>':''}`;
   menu.querySelector('[data-action="create-requirement"]')?.addEventListener('click',()=>{menu.remove();openRequirementModal(projectId,versionId);});
   menu.querySelector('[data-action="copy-version"]')?.addEventListener('click',()=>{menu.remove();createVersionCopy(projectId,versionId);});
+  menu.querySelector('[data-action="copy-version-project"]')?.addEventListener('click',event=>{
+    event.stopPropagation();
+    const rect=menu.getBoundingClientRect();
+    menu.remove();
+    showVersionCopyProjectMenu(projectId,versionId,rect.left,rect.top);
+  });
   document.body.appendChild(menu);
+  menu.style.left=`${Math.max(window.scrollX+8,Math.min(event.pageX,window.scrollX+window.innerWidth-menu.offsetWidth-8))}px`;
+  menu.style.top=`${Math.max(window.scrollY+8,Math.min(event.pageY,window.scrollY+window.innerHeight-menu.offsetHeight-8))}px`;
   document.addEventListener('click',removeVersionContextMenu,{once:true});
 }
 
-function removeVersionContextMenu(){const menu=$('#version-context-menu');if(menu)menu.remove();}
+function removeVersionContextMenu(){
+  ['version-context-menu','version-copy-project-menu'].forEach(id=>{const menu=$(`#${id}`);if(menu)menu.remove();});
+}
 
-async function createVersionCopy(projectId,versionId){
+function showVersionCopyProjectMenu(projectId,versionId,left,top){
+  removeVersionContextMenu();
+  const targets=state.projects.filter(project=>Number(project.id)!==Number(projectId));
+  if(!targets.length){showToast('当前没有可复制到的其他项目','error');return;}
+  const menu=document.createElement('div');
+  menu.id='version-copy-project-menu';menu.className='context-menu';
+  menu.innerHTML=targets.map(project=>`<div data-project-id="${project.id}">${escapeHtml(project.name)}</div>`).join('');
+  document.body.appendChild(menu);
+  menu.style.left=`${Math.max(window.scrollX+8,Math.min(left,window.scrollX+window.innerWidth-menu.offsetWidth-8))}px`;
+  menu.style.top=`${Math.max(window.scrollY+8,Math.min(top,window.scrollY+window.innerHeight-menu.offsetHeight-8))}px`;
+  menu.querySelectorAll('[data-project-id]').forEach(item=>{
+    item.addEventListener('click',async event=>{
+      event.stopPropagation();
+      const targetProjectId=Number(item.dataset.projectId);
+      menu.remove();
+      await createVersionCopy(projectId,versionId,targetProjectId);
+    });
+  });
+  document.addEventListener('click',removeVersionContextMenu,{once:true});
+}
+
+async function createVersionCopy(projectId,versionId,targetProjectId=projectId){
   const source=(state.versions[projectId]||[]).find(version=>version.id===versionId);
-  if(!source)return;
-  const name=prompt(`基于“${source.version_name}”创建副本，输入副本名称：`);
+  const targetProject=state.projects.find(project=>Number(project.id)===Number(targetProjectId));
+  if(!source||!targetProject)return;
+  const crossProject=Number(targetProjectId)!==Number(projectId);
+  const name=prompt(
+    crossProject
+      ? `将“${source.version_name}”复制到项目“${targetProject.name}”，请输入目标版本名称：`
+      : `基于“${source.version_name}”创建副本，输入副本名称：`,
+    crossProject?`${source.version_name}副本`:''
+  );
   if(name===null||!name.trim())return;
-  if(!confirm(`确定创建版本副本“${name.trim()}”吗？将复制该版本的用例、执行结果、图片和合并关系。`))return;
+  if(!confirm(`确定将版本“${source.version_name}”复制到项目“${targetProject.name}”，生成“${name.trim()}”吗？将复制用例、执行结果、图片、列配置、合并关系和需求记录。`))return;
   try{
-    const res=await api(`/api/projects/${projectId}/versions/${versionId}/copy`,{method:'POST',body:JSON.stringify({version_name:name.trim()})});
-    await loadVersionsForProject(projectId);renderProjects();
-    showToast(`版本副本创建成功，共复制 ${res.data?.copied_cases??0} 条用例`);
+    const res=await api(`/api/projects/${projectId}/versions/${versionId}/copy`,{method:'POST',body:JSON.stringify({version_name:name.trim(),target_project_id:targetProjectId})});
+    await loadVersionsForProject(targetProjectId);renderProjects();
+    showToast(`${crossProject?'版本已复制到':'版本副本创建成功'} ${targetProject.name}，共复制 ${res.data?.copied_cases??0} 条用例`);
   }catch(err){showToast(err.message,'error');}
 }
 
@@ -590,9 +801,42 @@ function renderCurrentVersionName(){
 
 async function loadColumns(){
   if(!state.currentProject||!state.currentVersion){state.columns=[];return;}
-  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`);state.columns=(res.data||[]).sort(columnSortCompare);
+  const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns`);
+  state.columns=(res.data||[]).sort(columnSortCompare).map(column=>{
+    const pending=state.pendingColumnWidths[Number(column.id)];
+    return pending===undefined?column:{...column,width:pending};
+  });
 }
 function visibleColumns(){return state.columns.filter(c=>c.is_visible);}
+
+function applyPendingColumnWidths(columns){
+  return (columns||[]).map(column=>{
+    const pending=state.pendingColumnWidths[Number(column.id)];
+    return pending===undefined?column:{...column,width:pending};
+  });
+}
+
+function persistColumnWidth(column,width){
+  const columnId=Number(column?.id);
+  if(!Number.isInteger(columnId)||columnId<=0)return;
+  const normalized=Math.max(60,Math.round(Number(width)||120));
+  state.pendingColumnWidths[columnId]=normalized;
+  const request=api(`/api/columns/${columnId}`,{method:'PUT',body:JSON.stringify({width:normalized})})
+    .then(()=>{})
+    .catch(err=>{
+      if(state.pendingColumnWidths[columnId]===normalized)delete state.pendingColumnWidths[columnId];
+      showToast(`列宽保存失败：${err.message}`,'error');
+    });
+  state.pendingColumnWidthSaves[columnId]=request;
+  request.finally(()=>{
+    if(state.pendingColumnWidthSaves[columnId]===request)delete state.pendingColumnWidthSaves[columnId];
+  });
+}
+
+async function flushPendingColumnWidthSaves(){
+  const requests=Object.values(state.pendingColumnWidthSaves);
+  if(requests.length)await Promise.all(requests);
+}
 
 function updateAggregateColumnHeaders(){
   $$('#case-table thead th[data-key]').forEach(th=>{
@@ -608,6 +852,12 @@ function updateAggregateColumnHeaders(){
 
 async function loadCases(){
   if(!state.currentVersion)return;
+  // 快速新增行属于当前版本的临时编辑区。搜索、分页、刷新或切换版本
+  // 会重绘表格，离开前默认保存，只有明确点击“取消新增行”才丢弃输入。
+  if(state.quickAddRow){
+    const saved=await saveQuickRows({silent:true,refresh:false});
+    if(!saved)return;
+  }
   // 重新加载会重建表格 DOM。若当前仍有单击编辑中的输入框，先提交它，
   // 避免旧输入框被移除后再从空的 td.textContent 读取并覆盖原内容。
   const activeEdit=state.inlineEditing;
@@ -622,7 +872,10 @@ async function loadCases(){
   // 状态更新、筛选和刷新可能同时发起请求；只接受最后一次请求，
   // 防止较早返回的旧筛选结果覆盖当前页面。
   if(loadSerial!==state.casesLoadSerial||state.currentProject?.id!==projectId||state.currentVersion?.id!==versionId)return;
-  state.cases=res.data.cases||[];state.total=res.data.total||0;state.columns=res.data.columns||state.columns;state.merges=res.data.merges||[];renderTable();renderPagination();
+  state.cases=res.data.cases||[];state.total=res.data.total||0;
+  if(res.data.columns)state.columns=applyPendingColumnWidths(res.data.columns).sort(columnSortCompare);
+  state.merges=res.data.merges||[];renderTable();renderPagination();
+  scheduleSaveViewAnchor();
 }
 
 async function loadStats(){
@@ -695,7 +948,7 @@ function renderSummaryModal(d){
     <div class="summary-options">
       <label>总结字段 <select id="summary-field-select">${fields}</select></label>
       <label class="summary-image-toggle"><input type="checkbox" id="summary-show-images" ${state.summaryShowImages?'checked':''}>显示图片</label>
-      <span class="summary-option-tip">默认不显示图片</span>
+      <span class="summary-option-tip">默认不显示图片${d.excluded_strikethrough?`；已排除标题带删除线的 ${d.excluded_strikethrough} 条用例`:''}</span>
       <button type="button" class="secondary" id="summary-export-html">导出 HTML</button>
       <button type="button" class="secondary" id="summary-export-image">导出图片</button>
     </div>
@@ -767,15 +1020,19 @@ function applyCaseRowHeightStyle(tr,height){
 }
 
 function renderTable(){
-  if(state.quickAddRow){renderQuickAddRows();return;}
+  if(state.quickAddRow){renderQuickAddRows();updateMergeButtonUI();return;}
+  const quickActions=$('#quick-add-actions');
+  if(quickActions)quickActions.style.display='none';
   const cols=visibleColumns();const thead=$('#case-table thead');const tbody=$('#case-table tbody');
   const hasVersion=Boolean(state.currentVersion);
-  const showActions=state.editMode&&hasVersion;
+  const showActions=false;
   const showSelection=state.editMode&&hasVersion;
   if(!hasVersion){
     thead.innerHTML='';
     tbody.innerHTML='<tr><td class="empty-state no-version-state">该项目暂无版本，请先新建版本</td></tr>';
     updateSelectedCaseCount();
+    updateExportButton();
+    updateMergeButtonUI();
     return;
   }
   const ths=cols.map(c=>{
@@ -792,6 +1049,8 @@ function renderTable(){
     // 批量删除最后一页/全部用例后没有复选框可供统计，仍需主动清零按钮文案，
     // 否则会残留“批量删除（85）”这样的旧数量。
     updateSelectedCaseCount();
+    updateExportButton();
+    updateMergeButtonUI();
     return;
   }
   const pageIds=state.cases.map(tc=>tc.id);
@@ -799,8 +1058,13 @@ function renderTable(){
     const cells=cols.map(c=>renderCell(c,tc,pageIds));
     const tr=document.createElement('tr');
     tr.dataset.caseId=tc.id;
+    if(Number(state.casePasteTargetId)===Number(tc.id))tr.classList.add('case-paste-target');
     applyCaseRowHeightStyle(tr,Number(tc.row_height)||36);
-    tr.addEventListener('mousedown',()=>{state.formatRowCaseId=tc.id;});
+    tr.addEventListener('mousedown',event=>{
+      state.formatRowCaseId=tc.id;
+      setCasePasteTargetFromEvent(event,tc.id);
+      scheduleSaveViewAnchor(tc.id);
+    });
     tr.addEventListener('contextmenu',showRowContextMenu);
     tr.innerHTML=`${showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:''}${cells.join('')}${showActions?renderActionsCell(tc.id):''}`;
     tbody.appendChild(tr);
@@ -808,6 +1072,8 @@ function renderTable(){
   bindRowHeightResize();
   if(state.editMode)bindColumnResize();
   updateSelectedCaseCount();
+  updateExportButton();
+  updateMergeButtonUI();
 }
 
 function toggleAllCases(checked){
@@ -819,6 +1085,86 @@ function updateSelectedCaseCount(){
   const selected=$$('.case-select:checked').length;
   const button=$('#btn-batch-delete');
   if(button)button.textContent=selected?`批量删除（${selected}）`:'批量删除';
+  updateCaseClipboardUI();
+  updateExportButton();
+}
+
+function primaryCaseColumn(){
+  const columns=visibleColumns();
+  return columns.find(column=>column.key==='case_no')||columns[0]||null;
+}
+
+function clearCasePasteTarget(){
+  state.casePasteTargetId=null;
+  $$('#case-table tbody tr.case-paste-target').forEach(row=>row.classList.remove('case-paste-target'));
+  $$('#case-table tbody td.paste-target-cell').forEach(item=>item.classList.remove('paste-target-cell'));
+  updateCaseClipboardUI();
+}
+
+function setCasePasteTargetFromEvent(event,caseId){
+  if(!state.editMode||!state.currentVersion)return;
+  const cell=event.target?.closest?.('td[data-key]');
+  const primary=primaryCaseColumn();
+  if(!cell||!primary||cell.dataset.key!==primary.key){
+    clearCasePasteTarget();
+    return;
+  }
+  state.casePasteTargetId=Number(caseId);
+  $$('#case-table tbody tr.case-paste-target').forEach(row=>row.classList.remove('case-paste-target'));
+  $$('#case-table tbody td.paste-target-cell').forEach(item=>item.classList.remove('paste-target-cell'));
+  cell.closest('tr')?.classList.add('case-paste-target');
+  cell.classList.add('paste-target-cell');
+  updateCaseClipboardUI();
+}
+
+function updateCaseClipboardUI(){
+  // 复制、剪切、粘贴入口位于首列右键菜单；菜单每次打开时读取最新选择和剪贴板状态。
+}
+
+function captureSelectedCasesToClipboard(action){
+  if(!state.editMode||state.currentUser?.can_write!==true)return;
+  const caseIds=selectedCaseIds();
+  if(!caseIds.length){showToast(`请先勾选要${action==='cut'?'剪切':'复制'}的用例`,'error');return;}
+  const scope=activeVersionScope();
+  if(!scope){showToast('请先选择当前版本','error');return;}
+  state.caseClipboard={action,caseIds,projectId:scope.projectId,versionId:scope.versionId};
+  updateCaseClipboardUI();
+  showToast(`已${action==='cut'?'剪切':'复制'} ${caseIds.length} 条用例，请点击首列目标行后粘贴`);
+}
+
+async function pasteCasesFromClipboard(){
+  const clipboard=state.caseClipboard;
+  const scope=activeVersionScope();
+  const targetId=Number(state.casePasteTargetId)||0;
+  if(!clipboard?.caseIds?.length){showToast('请先复制或剪切用例','error');return;}
+  if(!scope||Number(clipboard.projectId)!==scope.projectId||Number(clipboard.versionId)!==scope.versionId){
+    showToast('只能在当前版本内粘贴用例，请重新复制或剪切','error');return;
+  }
+  if(!targetId){showToast('请先点击用例编号列选择粘贴目标行','error');return;}
+  if(clipboard.caseIds.includes(targetId)){showToast('粘贴目标行不能是选中的用例','error');return;}
+  state.caseClipboardBusy=true;updateCaseClipboardUI();
+  try{
+    const result=await api(`/api/projects/${scope.projectId}/versions/${scope.versionId}/cases/clipboard`,{
+      method:'POST',
+      body:JSON.stringify({action:clipboard.action,case_ids:clipboard.caseIds,target_case_id:targetId,target_position:'above'}),
+    });
+    const count=result.data?.count||clipboard.caseIds.length;
+    if(clipboard.action==='cut')state.caseClipboard=null;
+    state.casePasteTargetId=null;
+    await Promise.all([loadCases(),loadStats()]);
+    showToast(`已${clipboard.action==='cut'?'剪切':'复制'}粘贴 ${count} 条用例`);
+  }catch(err){showToast(err.message,'error');}
+  finally{state.caseClipboardBusy=false;updateCaseClipboardUI();}
+}
+
+function updateExportButton(){
+  const exportButton=$('#btn-export-excel');
+  if(!exportButton)return;
+  const selected=$$('.case-select:checked').length;
+  if(selected)exportButton.textContent=`下载选中用例（${selected}）`;
+  else if(state.currentVersion)exportButton.textContent='下载当前版本 Excel';
+  else if(state.currentProject)exportButton.textContent='下载整个项目 Excel';
+  else exportButton.textContent='下载 Excel';
   const all=$$('.case-select').length>0&&selected===$$('.case-select').length;
   const header=$('#select-all-cases');
   if(header)header.checked=all;
@@ -863,6 +1209,10 @@ function showRowContextMenu(e){
   // 用例编号列不参与合并。记录实际右键所在的列，避免目标用例的标题、模块等
   // 其他列处于合并区域时，把“按序号插入”错误地推到合并块末尾。
   const clickedColumn=e.target.closest('td[data-key]')?.dataset.key||'';
+  const primary=primaryCaseColumn();
+  const isPrimaryColumn=Boolean(primary&&clickedColumn===primary.key);
+  if(isPrimaryColumn)setCasePasteTargetFromEvent(e,caseId);
+  else clearCasePasteTarget();
   const insertColumnKey=clickedColumn==='case_no'?'case_no':'';
   // 这里只允许传递两个固定值，使用 HTML 属性内的单引号，避免把
   // JSON.stringify 产生的双引号嵌入 onclick 双引号后截断点击脚本。
@@ -870,13 +1220,34 @@ function showRowContextMenu(e){
   removeContextMenu();
   const menu=document.createElement('div');menu.id='row-context-menu';menu.className='context-menu';
   menu.style.left=e.pageX+'px';menu.style.top=e.pageY+'px';
+  const selectedCount=selectedCaseIds().length;
+  const clipboardCount=state.caseClipboard?.caseIds?.length||0;
+  const canClipboard=state.currentUser?.can_write===true&&Boolean(state.currentVersion);
+  const clipboardItems=isPrimaryColumn?`
+    <div class="context-separator"></div>
+    <div data-clipboard-action="copy" class="${canClipboard&&selectedCount?'':'context-disabled'}">复制选中用例${selectedCount?`（${selectedCount}）`:''}</div>
+    <div data-clipboard-action="cut" class="${canClipboard&&selectedCount?'':'context-disabled'}">剪切选中用例${selectedCount?`（${selectedCount}）`:''}</div>
+    <div data-clipboard-action="paste" class="${canClipboard&&clipboardCount?'':'context-disabled'}">粘贴用例${clipboardCount?`（自动插入 ${clipboardCount} 条）`:'（请先复制或剪切）'}</div>
+  `:'';
   menu.innerHTML=`
     <div onclick="insertQuickRow(${caseId},'above',1,${insertColumnArg});removeContextMenu();">在上方插入行</div>
     <div onclick="insertQuickRow(${caseId},'below',1,${insertColumnArg});removeContextMenu();">在下方插入行</div>
     <div onclick="insertQuickRowPrompt(${caseId},'above',${insertColumnArg});removeContextMenu();">在上方插入多行</div>
     <div onclick="insertQuickRowPrompt(${caseId},'below',${insertColumnArg});removeContextMenu();">在下方插入多行</div>
+    ${clipboardItems}
   `;
+  menu.querySelectorAll('[data-clipboard-action]').forEach(item=>item.addEventListener('click',async event=>{
+    event.stopPropagation();
+    if(item.classList.contains('context-disabled'))return;
+    removeContextMenu();
+    const action=item.dataset.clipboardAction;
+    if(action==='copy'||action==='cut')captureSelectedCasesToClipboard(action);
+    else await pasteCasesFromClipboard();
+  }));
   document.body.appendChild(menu);
+  // 右键靠近表格底部时，菜单不能继续向下溢出屏幕，否则复制项会被遮住。
+  menu.style.left=`${Math.max(window.scrollX+8,Math.min(e.pageX,window.scrollX+window.innerWidth-menu.offsetWidth-8))}px`;
+  menu.style.top=`${Math.max(window.scrollY+8,Math.min(e.pageY,window.scrollY+window.innerHeight-menu.offsetHeight-8))}px`;
   document.addEventListener('click',removeContextMenu,{once:true});
 }
 
@@ -933,6 +1304,22 @@ function activeVersionScope(){
 }
 
 function columnTextAlign(c){return ['left','center','right'].includes(c?.text_align)?c.text_align:'left';}
+function priorityMode(column){return column?.priority_mode==='levels'?'levels':'codes';}
+function priorityCode(value){
+  const raw=(value??'').toString().trim();
+  return PRIORITY_CODE_BY_VALUE[raw]||raw.toUpperCase();
+}
+function priorityDisplayValue(value,column){
+  const code=priorityCode(value);
+  return priorityMode(column)==='levels'?(PRIORITY_LEVEL_BY_CODE[code]||value||''):code||'';
+}
+function priorityOptionsHtml(column,value){
+  const mode=priorityMode(column);
+  const selected=priorityDisplayValue(value,column);
+  return (PRIORITY_OPTIONS[mode]||PRIORITY_OPTIONS.codes).map(option=>
+    `<option value="${escapeHtml(option)}" ${selected===option?'selected':''}>${escapeHtml(option)}</option>`
+  ).join('');
+}
 function getCaseColumnValue(tc,col){
   if(!tc||!col)return '';
   if(col.is_system)return tc[col.key]??'';
@@ -1032,8 +1419,22 @@ function renderCell(c,tc,pageIds=[],ignoreMerge=false){
 
 function renderCellContent(c,tc,rowspan=1,valueOverride){
   const selected=state.mergeAnchor?.key===c.key&&state.mergeAnchor?.caseId===tc.id;
+  if(c.key==='priority'&&!state.mergeMode&&rowspan===1&&valueOverride===undefined){
+    const value=getCaseColumnValue(tc,c);
+    const displayValue=priorityDisplayValue(value,c);
+    const align=columnTextAlign(c);
+    if(state.editMode){
+      const readonlyAttr=state.currentUser?.can_write===true?'':' disabled';
+      return `<td data-key="priority" data-case="${tc.id}" class="priority-cell" style="text-align:${align}"><select class="priority-select" style="text-align:${align}" onchange="updatePriority(${tc.id},this.value,this)"${readonlyAttr}>${priorityOptionsHtml(c,value)}</select></td>`;
+    }
+    return `<td data-key="priority" data-case="${tc.id}" class="priority-cell" style="text-align:${align}" title="${escapeHtml(displayValue)}">${escapeHtml(displayValue)}</td>`;
+  }
   if(c.key==='status'){
     const selectAttr=state.mergeMode?` onclick="selectMergeCell(event,'${escapeHtml(c.key)}',${tc.id})"`:'';
+    if(tc.status_cleared){
+      const align=columnTextAlign(c);
+      return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="${rowspan>1?'merged-cell ':''}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor':''}" style="text-align:${align};vertical-align:middle"${rowspan>1?` rowspan="${rowspan}"`:''}${selectAttr}><span class="status-cleared" title="标题含删除线，执行结果已移除">—</span></td>`;
+    }
     const status=normalizeStatus(tc.status);
     const displayStatus=STATUS_LIST.includes(status)?status:'未执行';
     const statusColor=STATUS_COLORS[displayStatus]||'#606266';
@@ -1057,17 +1458,46 @@ function renderCellContent(c,tc,rowspan=1,valueOverride){
   return `<td data-key="${escapeHtml(c.key)}" data-case="${tc.id}" class="${mergeClass}${state.mergeMode?'merge-selectable ':''}${selected?'merge-anchor ':''}cell-text ${multiline?'multiline':''} ${c.key==='remark'?'rich-cell':''}" style="text-align:${columnTextAlign(c)}"${mergeAttr}${interaction} title="${str}">${contentHtml}</td>`;
 }
 
-function toggleMergeMode(mode){
-  state.mergeMode=state.mergeMode===mode?false:mode;state.mergeAnchor=null;renderTable();
-  showToast(state.mergeMode?(mode==='merge'?'请选择同一列的起止单元格':'请选择要取消合并的单元格'):'已退出单元格操作');
+function updateMergeButtonUI(){
+  const button=$('#btn-merge-cells');
+  if(!button)return;
+  const unmerge=state.mergeMode==='unmerge'&&state.selectedMerge;
+  button.textContent=unmerge?'取消合并':'合并单元格';
+  button.title=unmerge?'取消当前选中的合并单元格':'选择同一列的起止单元格进行合并';
+  button.classList.toggle('danger',Boolean(unmerge));
+  button.classList.toggle('secondary',!unmerge);
 }
+
+async function toggleMergeButton(){
+  if(state.mergeMode==='unmerge'&&state.selectedMerge){
+    try{
+      await api(`/api/merges/${state.selectedMerge.id}`,{method:'DELETE'});
+      state.mergeMode=false;state.mergeAnchor=null;state.selectedMerge=null;
+      await loadCases();showToast('已取消合并');
+    }catch(err){showToast(err.message,'error');}
+    return;
+  }
+  if(state.mergeMode){
+    state.mergeMode=false;state.mergeAnchor=null;state.selectedMerge=null;renderTable();
+    showToast('已退出单元格操作');
+    return;
+  }
+  state.mergeMode='merge';state.mergeAnchor=null;state.selectedMerge=null;renderTable();
+  showToast('请选择同一列的起止单元格');
+}
+
 async function selectMergeCell(event,key,caseId){
   event.stopPropagation();
   const scope=activeVersionScope();
   if(!scope){showToast('项目与版本已变化，请重新选择版本','error');return;}
+  const existingMerge=findMerge({key},caseId);
+  if(state.mergeMode==='merge'&&existingMerge){
+    state.mergeMode='unmerge';state.selectedMerge=existingMerge;state.mergeAnchor={key,caseId};renderTable();
+    showToast('已选择合并单元格，请点击“取消合并”');
+    return;
+  }
   if(state.mergeMode==='unmerge'){
-    const merge=findMerge({key},caseId);if(!merge){showToast('该单元格未合并','error');return;}
-    try{await api(`/api/merges/${merge.id}`,{method:'DELETE'});state.mergeAnchor=null;await loadCases();showToast('已取消合并');}catch(err){showToast(err.message,'error');}
+    showToast('请点击“取消合并”完成操作','error');
     return;
   }
   if(!state.mergeAnchor){state.mergeAnchor={key,caseId};renderTable();return;}
@@ -1078,7 +1508,7 @@ async function selectMergeCell(event,key,caseId){
   if(to-from<1){showToast('至少选择两个连续单元格','error');return;}
   try{
     await api(`/api/projects/${scope.projectId}/versions/${scope.versionId}/merges`,{method:'POST',body:JSON.stringify({column_key:key,case_ids:ids.slice(from,to+1)})});
-    state.mergeMode=false;state.mergeAnchor=null;await loadCases();showToast('单元格合并成功');
+    state.mergeMode=false;state.mergeAnchor=null;state.selectedMerge=null;await loadCases();showToast('单元格合并成功');
   }catch(err){showToast(err.message,'error');}
 }
 
@@ -1236,6 +1666,11 @@ function openCellEditorFromDoubleClick(event,td,key,caseId){
   event?.preventDefault();
   event?.stopPropagation();
   clearPendingCellClick();
+  const selectedIds=Array.from($$('.case-select:checked')).map(box=>Number(box.value));
+  if(selectedIds.includes(Number(caseId))){
+    openCaseModal(state.cases.find(item=>Number(item.id)===Number(caseId))||null);
+    return;
+  }
   startInlineEdit(td,key,caseId);
 }
 
@@ -1256,6 +1691,8 @@ function beginCellEdit(td,key,caseId){
   const richEditor=true;
   const editor=document.createElement(richEditor?'div':(multiline?'textarea':'input'));
   editor.className='inline-cell-editor';
+  editor.dataset.key=key;
+  editor.dataset.systemColumn=col.is_system?'true':'false';
   if(richEditor){editor.contentEditable='true';editor.classList.add('rich-editor');editor.dataset.applyDefaultFormat='true';setEditorValue(editor,oldVal);applyDefaultFormatToEditor(editor);editor.addEventListener('input',()=>{editing.lastValue=getEditorValue(editor);editor.dataset.defaultFormatDirty='true';});}
   else editor.value=oldVal;
   if(multiline){editor.rows=Math.max(3,Math.min(8,oldVal.split('\n').length+1));}
@@ -1348,6 +1785,8 @@ function startInlineEdit(td,key,caseId){
   const oldVal=(valueOverride??(merge?getMergedCellValue(col,merge):getCaseColumnValue(tc,col))).toString();
   state.editingCell={caseId,key,col,merge,oldVal,uploadedImageIds:[]};
   $('#cell-editor-title').textContent=`编辑：${col.name}`;
+  $('#cell-editor-input').dataset.key=key;
+  $('#cell-editor-input').dataset.systemColumn=col.is_system?'true':'false';
   setEditorValue($('#cell-editor-input'),oldVal);
   state.caseImages=[];
   openModal('#cell-editor-modal');
@@ -1402,6 +1841,23 @@ async function updateStatus(id,status,select){
   }
 }
 
+async function updatePriority(id,value,select){
+  const localCase=state.cases.find(item=>Number(item.id)===Number(id));
+  const previousValue=localCase?.priority??'';
+  if(localCase)localCase.priority=value;
+  try{
+    await api(`/api/cases/${id}`,{method:'PUT',body:JSON.stringify({priority:value})});
+    await loadCases();
+  }catch(err){
+    if(localCase)localCase.priority=previousValue;
+    if(select){
+      const column=state.columns.find(item=>item.key==='priority');
+      select.value=priorityDisplayValue(previousValue,column);
+    }
+    showToast(err.message,'error');
+  }
+}
+
 async function resetCaseNumbers(){
   if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}
   if(!confirm('确定将当前版本的用例编号按列表顺序重置为 1、2、3……吗？'))return;
@@ -1421,7 +1877,11 @@ function openCaseModal(tc=null){
     const value=c.is_system?(tc?.[c.key]??''):(tc?.custom_fields?.[c.key]??'');
     let control;
     if(c.key==='status'){
-      control=`<select class="case-form-field" data-key="${escapeHtml(c.key)}">${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${value===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select>`;
+      control=tc?.status_cleared
+        ?`<span class="case-form-field status-cleared" data-key="${escapeHtml(c.key)}" title="标题含删除线，保存后仍保持移除">已移除（标题含删除线）</span>`
+        :`<select class="case-form-field" data-key="${escapeHtml(c.key)}">${STATUS_LIST.map(s=>`<option value="${escapeHtml(s)}" ${value===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select>`;
+    }else if(c.key==='priority'){
+      control=`<select class="case-form-field priority-form-select" data-key="${escapeHtml(c.key)}">${priorityOptionsHtml(c,value)}</select>`;
     }else{
       control=`<div class="case-form-field rich-editor" data-key="${escapeHtml(c.key)}" data-apply-default-format="${tc?'false':'true'}" contenteditable="true" role="textbox" data-placeholder="可直接输入；选中文字后可使用格式工具">${richTextHtml(value)}</div>`;
     }
@@ -1978,14 +2438,16 @@ function insertQuickRowPrompt(caseId,position,columnKey=''){
   insertQuickRow(caseId,position,parseInt(n)||1,columnKey);
 }
 
-function cancelQuickRow(){state.quickAddRow=false;state.quickInsertTarget=null;state.quickInsertCount=1;renderTable();}
+function cancelQuickRow(){state.quickAddRow=false;state.quickInsertTarget=null;state.quickInsertCount=1;const actions=$('#quick-add-actions');if(actions)actions.style.display='none';renderTable();}
 
 function buildQuickInputRow(i,cols){
   return cols.map(c=>{
-    if(c.key==='status')return `<td><select id="qa-status-${i}">${STATUS_LIST.map(s=>`<option value="${s}" ${s==='未执行'?'selected':''}>${s}</option>`).join('')}</select></td>`;
+    const width=Math.max(60,Number(c.width)||120);
+    const cellStyle=`style="width:${width}px;min-width:${width}px;max-width:${width}px"`;
+    if(c.key==='status')return `<td ${cellStyle}><select id="qa-status-${i}">${STATUS_LIST.map(s=>`<option value="${s}" ${s==='未执行'?'selected':''}>${s}</option>`).join('')}</select></td>`;
     const isLong=c.key==='steps'||c.key==='remark'||c.key==='precondition'||c.key==='expected_result'||!c.is_system;
-    return `<td>${isLong?`<textarea id="qa-${c.key}-${i}"></textarea>`:`<input id="qa-${c.key}-${i}">`}</td>`;
-  }).join('')+`<td class="actions-cell">${i===0?`<button onclick="saveQuickRows()">保存</button><button class="secondary" onclick="cancelQuickRow()">取消</button>`:'&nbsp;'}</td>`;
+    return `<td ${cellStyle}>${isLong?`<textarea id="qa-${c.key}-${i}"></textarea>`:`<input id="qa-${c.key}-${i}">`}</td>`;
+  }).join('');
 }
 
 function renderQuickAddRows(){
@@ -1998,8 +2460,11 @@ function renderQuickAddRows(){
   const thead=$('#case-table thead');
   const tbody=$('#case-table tbody');
   const showSelection=state.editMode;
-  const ths=cols.map(c=>`<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${c.width}px"><span class="col-title">${escapeHtml(c.name)}</span></th>`).join('');
-  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"></th>':''}${ths}${renderActionsHeader()}</tr>`;
+  const ths=cols.map(c=>{
+    const width=Math.max(60,Number(c.width)||120);
+    return `<th data-key="${escapeHtml(c.key)}" data-id="${c.id}" style="width:${width}px;min-width:${width}px;max-width:${width}px"><span class="col-title">${escapeHtml(c.name)}</span></th>`;
+  }).join('');
+  thead.innerHTML=`<tr>${showSelection?'<th class="select-header" style="width:44px"></th>':''}${ths}</tr>`;
   bindColumnContextMenu();
   tbody.innerHTML='';
   const count=state.quickInsertCount||1;
@@ -2018,7 +2483,7 @@ function renderQuickAddRows(){
     const selection=showSelection?`<td class="select-cell"><input type="checkbox" class="case-select" value="${tc.id}" onchange="updateSelectedCaseCount()" onclick="event.stopPropagation()" title="选择用例"></td>`:'';
     // 新增输入行可能位于原合并区域内部。预览阶段禁止 rowspan 跨过输入行，
     // 否则浏览器会吞掉后续行对应的单元格，表现为数据向前一列错位。
-    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds,true)).join('')}${renderActionsCell(tc.id)}`;
+    tr.innerHTML=`${selection}${cols.map(c=>renderCell(c,tc,pageIds,true)).join('')}`;
     tbody.appendChild(tr);
   }
 
@@ -2035,10 +2500,14 @@ function renderQuickAddRows(){
     for(let i=0;i<count;i++)appendInputRow(i);
   }
   bindRowHeightResize();
+  const quickActions=$('#quick-add-actions');
+  if(quickActions)quickActions.style.display='inline-flex';
 }
 
-async function saveQuickRows(){
-  if(!state.currentVersion)return;
+async function saveQuickRows(options={}){
+  if(!state.currentVersion)return true;
+  const silent=options.silent===true;
+  const refresh=options.refresh!==false;
   const cols=visibleColumns();
   const count=state.quickInsertCount||1;
   const target=state.quickInsertTarget||{};
@@ -2062,9 +2531,10 @@ async function saveQuickRows(){
       })
     });
     state.quickAddRow=false;state.quickInsertTarget=null;state.quickInsertCount=1;
-    await Promise.all([loadCases(),loadStats(),loadSummary()]);
-    showToast('已添加');
-  }catch(err){showToast(err.message,'error');}
+    if(refresh)await Promise.all([loadCases(),loadStats(),loadSummary()]);
+    if(!silent)showToast('已添加');
+    return true;
+  }catch(err){showToast(err.message,'error');return false;}
 }
 
 let draggedColumnItem=null;
@@ -2082,8 +2552,10 @@ function openColumnModal(){
         ?`<input class="column-name-input" data-id="${c.id}" value="${escapeHtml(c.name)}" maxlength="100" aria-label="自定义列名称">`
         :`<span class="column-setting-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>`}
       ${c.is_system?'<span class="tag">系统列</span>':`<span class="tag custom-tag">${c.aggregate_type==='sum'?'数字求和列':'自定义列'}</span>`}
-      ${c.is_system&&c.key==='case_no'?`<button class="secondary reset-column-number-btn" onclick="resetCaseNumbers()">重置编号</button>`:''}
-      ${c.is_system&&c.key==='status'?`<button class="secondary reset-column-status-btn" onclick="resetCaseStatus()">重置测试结果</button>`:''}
+      ${state.editMode&&c.is_system&&c.key==='priority'?`<label class="priority-mode-setting">显示方式<select class="priority-display-mode" data-id="${c.id}" aria-label="优先级显示方式"><option value="codes" ${priorityMode(c)==='codes'?'selected':''}>P0 / P1 / P2 / P3</option><option value="levels" ${priorityMode(c)==='levels'?'selected':''}>重要 / 高 / 中 / 低</option></select></label>`:''}
+      ${state.editMode&&c.is_system&&c.key==='case_no'?`<button class="secondary reset-column-number-btn" onclick="resetCaseNumbers()">重置编号</button>`:''}
+      ${state.editMode&&c.is_system&&c.key==='status'?`<button class="secondary reset-column-status-btn" onclick="resetCaseStatus()">重置测试结果</button>`:''}
+      ${state.editMode&&((c.is_system&&c.key!=='case_no'&&c.key!=='status')||!c.is_system)?`<button class="danger clear-column-btn" onclick="clearCaseColumn(${c.id})">清空列</button>`:''}
       ${!c.is_system&&state.editMode?`<select class="convert-system-select" onchange="convertColumnToSystem(${c.id},this.value)"><option value="">转为系统列…</option>${systemOptions}</select>`:''}
       ${!c.is_system&&state.editMode?`<button class="danger" onclick="removeCustomColumn(${c.id})">删除</button>`:''}
     </div>`).join('');
@@ -2098,6 +2570,19 @@ async function resetCaseStatus(){
     const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/reset-status`,{method:'POST'});
     await Promise.all([loadCases(),loadStats()]);
     showToast(`已重置 ${res.data?.reset||0} 条用例的测试结果`);
+  }catch(err){showToast(err.message,'error');}
+}
+
+async function clearCaseColumn(columnId){
+  if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}
+  const column=state.columns.find(item=>Number(item.id)===Number(columnId));
+  if(!column||column.key==='case_no'||column.key==='status')return;
+  if(!confirm(`确定清空当前版本全部用例的“${column.name}”列吗？该操作不可恢复。`))return;
+  try{
+    const res=await api(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/columns/${column.id}/clear`,{method:'POST'});
+    await Promise.all([loadCases(),loadStats(),loadSummary()]);
+    openColumnModal();
+    showToast(`已清空 ${res.data?.cleared||0} 条用例的“${column.name}”列`);
   }catch(err){showToast(err.message,'error');}
 }
 
@@ -2153,6 +2638,9 @@ async function saveColumnSettings(){
     for(const cb of $$('.col-vis')){
       await api(`/api/columns/${cb.dataset.id}`,{method:'PUT',body:JSON.stringify({is_visible:cb.checked})});
     }
+    for(const select of $$('.priority-display-mode')){
+      await api(`/api/columns/${select.dataset.id}`,{method:'PUT',body:JSON.stringify({priority_mode:select.value})});
+    }
     await loadColumns();
     renderTable();
     closeModal('#column-modal');
@@ -2193,6 +2681,8 @@ async function removeCustomColumn(id){if(!confirm('删除该列会清空所有�
 
 function openImportModal(){
   if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本，再导入 Excel','error');return;}
+  const bottomOption=document.querySelector('input[name="import-position"][value="bottom"]');
+  if(bottomOption)bottomOption.checked=true;
   openModal('#import-modal');$('#import-progress').style.width='0%';$('#import-progress').textContent='';$('#import-result').textContent='';
 }
 const dropzone=$('#import-dropzone');['dragenter','dragover'].forEach(ev=>{dropzone.addEventListener(ev,e=>{e.preventDefault();dropzone.classList.add('dragover');});});['dragleave','drop'].forEach(ev=>{dropzone.addEventListener(ev,e=>{e.preventDefault();dropzone.classList.remove('dragover');});});
@@ -2201,28 +2691,142 @@ dropzone.addEventListener('click',()=>$('#import-file').click());
 $('#import-file').addEventListener('change',e=>{if(e.target.files.length)uploadExcel(e.target.files[0]);});
 async function uploadExcel(file){
   if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本，再导入 Excel','error');return;}
-  $('#import-progress').style.width='10%';$('#import-progress').textContent='解析中...';const form=new FormData();form.append('file',file);
-  try{$('#import-progress').style.width='50%';const res=await fetch(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/import`,{method:'POST',body:form});const data=await res.json();if(data.success){$('#import-progress').style.width='100%';$('#import-progress').textContent='100%';$('#import-result').textContent=`导入成功：共导入 ${data.data.imported} 条用例`;await loadColumns();await Promise.all([loadCases(),loadStats()]);setTimeout(()=>closeModal('#import-modal'),1200);}else{throw new Error(data.message);}}catch(err){$('#import-progress').style.width='0%';$('#import-progress').textContent='';$('#import-result').textContent='导入失败：'+err.message;showToast(err.message,'error');}
+  const importPosition=document.querySelector('input[name="import-position"]:checked')?.value||'bottom';
+  const importPositionName=importPosition==='top'?'顶部':'底部';
+  $('#import-progress').style.width='10%';$('#import-progress').textContent='解析中...';const form=new FormData();form.append('file',file);form.append('import_position',importPosition);
+  try{$('#import-progress').style.width='50%';const res=await fetch(`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/import`,{method:'POST',body:form});const data=await res.json();if(data.success){$('#import-progress').style.width='100%';$('#import-progress').textContent='100%';$('#import-result').textContent=`导入成功：共导入 ${data.data.imported} 条用例，已导入到${importPositionName}`;await loadColumns();await Promise.all([loadCases(),loadStats()]);setTimeout(()=>closeModal('#import-modal'),1200);}else{throw new Error(data.message);}}catch(err){$('#import-progress').style.width='0%';$('#import-progress').textContent='';$('#import-result').textContent='导入失败：'+err.message;showToast(err.message,'error');}
 }
 
-async function backupDb(){
-  const path=prompt('请输入备份保存目录（留空使用默认目录）：','');if(path===null)return;
-  try{const body=path?JSON.stringify({backup_dir:path}):JSON.stringify({});const res=await api('/api/backup',{method:'POST',body:body});showToast(`备份已保存：${res.data.path}`);}catch(err){showToast(err.message,'error');}
+function formatBackupSize(bytes){
+  const value=Number(bytes)||0;
+  if(value<1024)return `${value} B`;
+  if(value<1024*1024)return `${(value/1024).toFixed(1)} KB`;
+  if(value<1024*1024*1024)return `${(value/1024/1024).toFixed(1)} MB`;
+  return `${(value/1024/1024/1024).toFixed(2)} GB`;
+}
+
+function showBackupPage(){
+  if(state.currentUser?.status!==2){showToast('只有管理员账号可以访问数据备份管理','error');return;}
+  state.backupPage=true;
+  $('#main-workspace').style.display='none';
+  $('#backup-page').style.display='flex';
+  loadBackups();
+}
+
+function hideBackupPage(){
+  state.backupPage=false;
+  state.selectedBackup=null;
+  $('#backup-page').style.display='none';
+  $('#main-workspace').style.display='flex';
+  renderBackupList();
+}
+
+function renderBackupList(){
+  const list=$('#backup-list');
+  if(!list)return;
+  if(!state.backups.length){
+    list.innerHTML='<div class="backup-empty"><div class="backup-placeholder-icon">▣</div><h3>暂无自动备份</h3><p>项目启动后会按 12 小时间隔自动生成全量备份。</p></div>';
+    return;
+  }
+  list.innerHTML=state.backups.map(item=>{
+    const selected=state.selectedBackup?.filename===item.filename;
+    const valid=item.valid;
+    return `<button type="button" class="backup-item ${selected?'selected':''} ${valid?'':'invalid'}" data-backup-filename="${escapeHtml(item.filename)}">
+      <span class="backup-item-title">${escapeHtml(item.created_at||item.filename)}</span>
+      <span class="backup-item-meta">${valid?`${formatBackupSize(item.size)}　${item.table_count} 张表　${item.row_count} 行　图片 ${item.image_count} 张`:'备份文件损坏或格式不支持'}</span>
+      <span class="backup-item-name">${escapeHtml(item.filename)}</span>
+    </button>`;
+  }).join('');
+  list.querySelectorAll('.backup-item').forEach(item=>item.addEventListener('click',()=>selectBackup(item.dataset.backupFilename)));
+}
+
+function renderSelectedBackup(){
+  const placeholder=$('#backup-restore-placeholder');
+  const content=$('#backup-restore-content');
+  const button=$('#btn-backup-restore');
+  if(!state.selectedBackup){
+    placeholder.style.display='block';content.style.display='none';button.disabled=true;return;
+  }
+  placeholder.style.display='none';content.style.display='block';
+  $('#backup-selected-title').textContent=state.selectedBackup.created_at||state.selectedBackup.filename;
+  $('#backup-selected-detail').innerHTML=state.selectedBackup.valid
+    ? `<div>文件：${escapeHtml(state.selectedBackup.filename)}</div><div>大小：${formatBackupSize(state.selectedBackup.size)}</div><div>数据：${state.selectedBackup.table_count} 张表、${state.selectedBackup.row_count} 行、图片 ${state.selectedBackup.image_count} 张</div><div>类型：${state.selectedBackup.reason==='restore_safety'?'回滚前保护备份':'定时备份'}</div>`
+    : `<div class="backup-error">${escapeHtml(state.selectedBackup.error||'备份文件损坏或格式不支持')}</div>`;
+  button.disabled=!state.selectedBackup.valid;
+}
+
+function selectBackup(filename){
+  state.selectedBackup=state.backups.find(item=>item.filename===filename)||null;
+  renderBackupList();
+  renderSelectedBackup();
+}
+
+async function loadBackups(){
+  try{
+    const res=await api('/api/admin/backups');
+    state.backups=res.data||[];
+    renderBackupList();renderSelectedBackup();
+  }catch(err){showToast(err.message,'error');}
+}
+
+async function restoreSelectedBackup(){
+  const selected=state.selectedBackup;
+  if(!selected?.valid)return;
+  const password=prompt('请输入回滚密码（项目删除/版本删除密码）：');
+  if(password===null)return;
+  if(!confirm(`确定回滚到 ${selected.created_at} 的备份吗？\n系统会先备份当前数据，回滚后当前数据将被替换。`))return;
+  const button=$('#btn-backup-restore');button.disabled=true;
+  try{
+    const res=await api(`/api/admin/backups/${encodeURIComponent(selected.filename)}/restore`,{method:'POST',body:JSON.stringify({password})});
+    showToast(`回滚成功，当前数据已先保存为 ${res.data.safety_backup}`);
+    localStorage.removeItem(viewAnchorStorageKey());
+    state.currentProject=null;state.currentVersion=null;state.versions={};state.projects=[];state.cases=[];state.backups=[];
+    hideBackupPage();
+    await initApp();
+  }catch(err){showToast(err.message,'error');button.disabled=false;}
 }
 
 async function exportCurrentVersionExcel(){
   if(!state.currentProject||!state.currentVersion){showToast('请先选择项目和版本','error');return;}
-  const url=`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/export`;
+  const selectedIds=Array.from($$('.case-select:checked')).map(box=>Number(box.value)).filter(Number.isInteger);
+  const query=selectedIds.length?`?case_ids=${encodeURIComponent(selectedIds.join(','))}`:'';
+  const url=`/api/projects/${state.currentProject.id}/versions/${state.currentVersion.id}/export${query}`;
   try{
-    showToast('正在生成 Excel，请稍候');
+    showToast(selectedIds.length?`正在导出 ${selectedIds.length} 条用例，请稍候`:'正在生成 Excel，请稍候');
     const res=await fetch(url);
     if(!res.ok){const data=await res.json().catch(()=>({}));throw new Error(data.message||`导出失败 ${res.status}`);}
     const blob=await res.blob();
     const objectUrl=URL.createObjectURL(blob);
-    const link=document.createElement('a');link.href=objectUrl;link.download=`${state.currentProject.name}_${state.currentVersion.version_name}_用例.xlsx`;
+    const link=document.createElement('a');link.href=objectUrl;link.download=`${state.currentProject.name}_${state.currentVersion.version_name}_${selectedIds.length?'选中用例':'用例'}.xlsx`;
     document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(objectUrl);
     showToast('Excel 下载成功');
   }catch(err){showToast(err.message,'error');}
+}
+
+async function exportCurrentProjectExcel(){
+  if(!state.currentProject){showToast('请先选择项目','error');return;}
+  const url=`/api/projects/${state.currentProject.id}/export`;
+  try{
+    showToast('正在生成整个项目 Excel，请稍候');
+    const res=await fetch(url);
+    if(!res.ok){const data=await res.json().catch(()=>({}));throw new Error(data.message||`导出失败 ${res.status}`);}
+    const blob=await res.blob();
+    const objectUrl=URL.createObjectURL(blob);
+    const link=document.createElement('a');link.href=objectUrl;link.download=`${state.currentProject.name}_全部用例.xlsx`;
+    document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(objectUrl);
+    showToast('整个项目 Excel 下载成功');
+  }catch(err){showToast(err.message,'error');}
+}
+
+async function exportCurrentContextExcel(){
+  const selectedIds=Array.from($$('.case-select:checked')).map(box=>Number(box.value)).filter(Number.isInteger);
+  if(selectedIds.length||state.currentVersion){
+    await exportCurrentVersionExcel();
+  }else if(state.currentProject){
+    await exportCurrentProjectExcel();
+  }else{
+    showToast('请先选择项目或版本','error');
+  }
 }
 
 async function downloadSummary(format){
@@ -2396,6 +3000,27 @@ async function readClipboardImageFiles(){
   }catch(err){return [];}
   return uniqueImageFiles(files);
 }
+
+function imagePasteColumnKey(target){
+  if(target?.id==='requirement-content-editor')return 'requirement';
+  return target?.dataset?.key||'';
+}
+
+function canPasteCaseImage(target){
+  const key=imagePasteColumnKey(target);
+  const column=state.columns.find(item=>item.key===key);
+  // 系统备注列和所有自定义列都允许在正文中粘贴图片；
+  // 标题、优先级等系统字段仍保持纯文本/固定值约束。
+  return key==='requirement'||key==='remark'||Boolean(column&&!column.is_system);
+}
+
+function showImagePasteHint(target){
+  const key=imagePasteColumnKey(target);
+  const column=state.columns.find(item=>item.key===key);
+  if(key==='requirement'||key==='remark'||(column&&!column.is_system))return;
+  showToast(`“${column?.name||key||'当前字段'}”不支持粘贴图片，请切换到备注列或自定义列。`,'error');
+}
+
 async function handlePastedImages(files,target=null,selectionRange=null){
   files=uniqueImageFiles(files.filter(isImageFile));
   if(!files.length)return;
@@ -2404,6 +3029,10 @@ async function handlePastedImages(files,target=null,selectionRange=null){
   const inlineEditingActive=target?.classList?.contains('inline-cell-editor');
   const caseId=caseModalActive?state.editingCase?.id:(cellModalActive?state.editingCell?.caseId:(inlineEditingActive?state.inlineEditing?.caseId:null));
   const richTarget=target?.isContentEditable?target:target?.closest?.('[contenteditable="true"]');
+  if(richTarget&&!canPasteCaseImage(richTarget)){
+    showImagePasteHint(richTarget);
+    return;
+  }
   if(!caseId){
     const accepted=addPendingImages(files);
     if(richTarget){
@@ -2467,6 +3096,11 @@ function setupPasteHandler(){
     const html=e.clipboardData?.getData('text/html')||'';
     const imagePlaceholder=/^\s*\[图片\]\s*$/.test(plainText);
     const mayContainImage=files.length||imagePlaceholder||clipboardTypes.includes('Files')||clipboardTypes.some(type=>type.startsWith('image/'));
+    if(mayContainImage&&!canPasteCaseImage(target)){
+      e.preventDefault();
+      showImagePasteHint(target);
+      return;
+    }
     if(mayContainImage&&isRepeatedImagePaste(target,files,html,plainText)){
       e.preventDefault();
       return;
@@ -2495,9 +3129,22 @@ function setupPasteHandler(){
 }
 setupPasteHandler();
 document.addEventListener('keydown',e=>{
+  const key=e.key.toLowerCase();
+  const target=e.target;
+  const tag=target?.tagName||'';
+  const textEditing=Boolean(target?.isContentEditable)
+    || (['INPUT','TEXTAREA','SELECT'].includes(tag)&&target.type!=='checkbox');
+  if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&!textEditing&&['c','x','v'].includes(key)
+      &&state.editMode&&state.currentUser?.can_write===true){
+    e.preventDefault();
+    if(key==='c')captureSelectedCasesToClipboard('copy');
+    else if(key==='x')captureSelectedCasesToClipboard('cut');
+    else void pasteCasesFromClipboard();
+    return;
+  }
   if(!e.ctrlKey||!e.shiftKey||e.key.toLowerCase()!=='x')return;
-  const target=e.target?.closest?.('[contenteditable="true"]');
-  if(!target)return;
+  const richTarget=e.target?.closest?.('[contenteditable="true"]');
+  if(!richTarget)return;
   e.preventDefault();
   toggleStrike();
 });
@@ -2515,17 +3162,18 @@ function bindColumnResize(){
       const key=th.dataset.key;
       const startX=e.clientX;
       const startW=th.offsetWidth;
+      let currentWidth=startW;
       function onMove(ev){
-        const w=Math.max(60,startW+ev.clientX-startX);
-        th.style.width=w+'px';
+        currentWidth=Math.max(60,Math.round(startW+ev.clientX-startX));
+        th.style.width=currentWidth+'px';
       }
       function onUp(){
         document.removeEventListener('mousemove',onMove);
         document.removeEventListener('mouseup',onUp);
         const col=state.columns.find(c=>c.key===key);
         if(col){
-          col.width=Math.max(60,th.offsetWidth);
-          api(`/api/columns/${col.id}`,{method:'PUT',body:JSON.stringify({width:col.width})}).catch(()=>{});
+          col.width=currentWidth;
+          persistColumnWidth(col,currentWidth);
         }
       }
       document.addEventListener('mousemove',onMove);
@@ -2536,16 +3184,19 @@ function bindColumnResize(){
 
 // 事件绑定
 $('#btn-add-project').onclick=createProject;
-$('#btn-add-case').onclick=addCase;
 $('#btn-import').onclick=openImportModal;
 $('#btn-columns').onclick=openColumnModal;
-$('#btn-export-excel').onclick=exportCurrentVersionExcel;
-$('#btn-backup').onclick=backupDb;
+$('#btn-export-excel').onclick=exportCurrentContextExcel;
+$('#btn-backup-management').onclick=showBackupPage;
+$('#btn-backup-page-back').onclick=hideBackupPage;
+$('#btn-backup-refresh').onclick=loadBackups;
+$('#btn-backup-restore').onclick=restoreSelectedBackup;
 $('#btn-search').onclick=()=>{state.keyword=$('#search-input').value;state.page=1;loadCases();};
 $('#search-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('#btn-search').click();});
 $('#status-filter-trigger').onclick=toggleStatusFilter;
 $$('input[name="status-filter-option"]').forEach(input=>input.addEventListener('change',onStatusFilterChange));
 document.addEventListener('click',e=>{if(!e.target.closest('#status-filter'))$('#status-filter')?.classList.remove('open');});
+window.addEventListener('resize',()=>positionStatusFilterOptions());
 updateStatusFilterUI();
 $('#save-case-btn').onclick=saveCase;
 $('#save-column-btn').onclick=saveColumnSettings;
@@ -2557,29 +3208,38 @@ $('#edit-mode-toggle').addEventListener('change',async e=>{
   // 删除内容等最后一次修改就无法提交；先完成当前单元格保存，再切换界面。
   clearPendingCellClick();
   if(state.inlineEditing)await commitInlineCellEdit(state.inlineEditing);
+  if(state.quickAddRow){
+    const saved=await saveQuickRows({silent:true});
+    if(!saved){e.target.checked=state.editMode;return;}
+  }
+  // 列宽保存请求必须在重绘前完成，否则刷新返回的旧列配置会覆盖刚拖动的宽度。
+  await flushPendingColumnWidthSaves();
   state.editMode=e.target.checked;
   if(state.editMode)state.actionsCollapsed=true;
   renderProjects();renderTable();renderPagination();
 });
 $('#btn-toggle-sidebar').onclick=()=>{state.sidebarCollapsed=!state.sidebarCollapsed;$('#sidebar').classList.toggle('collapsed',state.sidebarCollapsed);};
+$('#table-wrapper').addEventListener('scroll',()=>scheduleSaveViewAnchor(),{passive:true});
+window.addEventListener('beforeunload',()=>saveViewAnchor());
 $('#btn-add-version').onclick=createVersion;
 $('#btn-refresh-cases').onclick=refreshCurrentVersionCases;
 $('#btn-requirements').onclick=()=>openRequirementModal();
 $('#btn-quick-add').onclick=addQuickRow;
 $('#btn-summary').onclick=openSummaryModal;
-$('#btn-merge-cells').onclick=()=>toggleMergeMode('merge');
-$('#btn-unmerge-cells').onclick=()=>toggleMergeMode('unmerge');
+$('#btn-merge-cells').onclick=toggleMergeButton;
 $('#btn-batch-delete').onclick=deleteSelectedCases;
+$('#btn-save-quick-add').onclick=saveQuickRows;
+$('#btn-cancel-quick-add').onclick=cancelQuickRow;
 $('#save-requirement-btn').onclick=saveRequirement;
 function updateEditModeUI(){
-  const button=$('#btn-batch-delete');
-  if(button)button.style.display=state.editMode?'inline-flex':'none';
+  $$('.edit-mode-only').forEach(element=>{element.style.display=state.editMode?'inline-flex':'none';});
   const formatToolbar=$('#editor-format-toolbar');
   if(formatToolbar){
     const visible=state.editMode&&Boolean(state.currentVersion);
     formatToolbar.classList.toggle('visible',visible);
     formatToolbar.querySelectorAll('button,input,select').forEach(control=>{control.disabled=!visible;});
   }
+  updateCaseClipboardUI();
 }
 updateEditModeUI();
 $('#cell-editor-input').addEventListener('keydown',e=>{

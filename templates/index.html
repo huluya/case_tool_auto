@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>用例管理平台</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=20260908-02">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260930-03">
 </head>
 <body>
   <!-- 登录页 -->
@@ -36,14 +36,15 @@
         <button id="btn-columns">列设置</button>
         <button id="btn-import">用例导入</button>
         <button id="btn-export-excel">下载当前版本 Excel</button>
-        <button id="btn-backup" class="admin-only">数据库备份</button>
+        <button id="btn-backup-management" class="admin-only">数据备份管理</button>
       </div>
     </div>
 
-    <div class="main-container">
+    <div class="main-container" id="main-workspace">
       <!-- 侧边栏 -->
       <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
+          <button id="btn-toggle-sidebar" class="secondary" title="收起/展开项目列表">☰</button>
           <h3>项目列表</h3>
           <button id="btn-add-project">新建</button>
         </div>
@@ -53,14 +54,23 @@
       <!-- 内容区 -->
       <div class="content">
         <div class="toolbar">
-          <div class="toolbar-left">
-            <button id="btn-toggle-sidebar" class="secondary" title="收起/展开项目列表">☰</button>
-            <span id="current-version-name" style="font-weight:600;color:#303133"></span>
-            <button id="btn-add-version">新建版本</button>
-            <button id="btn-refresh-cases" class="secondary" title="仅刷新当前版本的用例">刷新用例</button>
-            <button id="btn-requirements" class="secondary" title="查看当前版本需求记录">需求记录</button>
+          <div class="toolbar-primary-row">
+            <div class="toolbar-left">
+              <span id="current-version-name" style="font-weight:600;color:#303133"></span>
+              <button id="btn-add-version">新建版本</button>
+              <button id="btn-requirements" class="secondary" title="查看当前版本需求记录">需求记录</button>
+              <button id="btn-refresh-cases" class="secondary" title="仅刷新当前版本的用例">刷新用例</button>
+            </div>
+            <div class="toolbar-primary-actions">
+              <button id="btn-quick-add" class="success">快速添加行</button>
+              <button id="btn-merge-cells" class="secondary">合并单元格</button>
+              <span id="quick-add-actions" class="quick-add-actions" style="display:none">
+                <button id="btn-save-quick-add" class="success">保存新增行</button>
+                <button id="btn-cancel-quick-add" class="secondary">取消新增行</button>
+              </span>
+            </div>
           </div>
-          <div class="toolbar-right">
+          <div class="toolbar-query-row">
             <div class="toolbar-search-box">
               <div class="search-box">
                 <input type="text" id="search-input" placeholder="搜索用例标题/序号/模块">
@@ -82,11 +92,7 @@
               <span class="switch-slider"></span>
               <span>编辑模式</span>
             </label>
-            <button id="btn-quick-add" class="success">快速添加行</button>
-            <button id="btn-add-case" class="success">新增用例</button>
             <button id="btn-batch-delete" class="danger edit-mode-only">批量删除</button>
-            <button id="btn-merge-cells" class="secondary">合并单元格</button>
-            <button id="btn-unmerge-cells" class="secondary">取消合并</button>
           </div>
         </div>
 
@@ -100,6 +106,34 @@
         <div class="pagination" id="pagination"></div>
       </div>
     </div>
+
+    <!-- 管理员专用的数据备份管理页；备份本身由后台定时器自动生成。 -->
+    <section id="backup-page" class="backup-page" aria-label="数据备份管理" style="display:none">
+      <div class="backup-page-header">
+        <button id="btn-backup-page-back" class="secondary">返回</button>
+        <div>
+          <h2>数据备份管理</h2>
+          <p>系统每 12 小时自动备份一次，备份保留 7 天。回滚前会自动保存当前数据。</p>
+        </div>
+        <button id="btn-backup-refresh" class="secondary">刷新列表</button>
+      </div>
+      <div class="backup-page-body">
+        <div id="backup-list" class="backup-list" aria-live="polite"></div>
+        <div class="backup-restore-panel">
+          <div class="backup-restore-placeholder" id="backup-restore-placeholder">
+            <div class="backup-placeholder-icon">▣</div>
+            <h3>请选择一个备份</h3>
+            <p>选中左侧备份后，这里会显示回滚按钮。</p>
+          </div>
+          <div id="backup-restore-content" style="display:none">
+            <h3 id="backup-selected-title">已选择备份</h3>
+            <div id="backup-selected-detail" class="backup-selected-detail"></div>
+            <button id="btn-backup-restore" class="danger" disabled>回滚到此备份</button>
+            <p class="backup-warning">回滚会覆盖当前数据库。系统会先自动生成一份“回滚前保护备份”。</p>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div id="selection-format-menu" class="selection-format-menu" role="toolbar" aria-label="文本对齐工具"></div>
@@ -183,9 +217,14 @@
         <button class="close-btn" onclick="closeModal('#import-modal')">&times;</button>
       </div>
       <div class="modal-body">
+        <div class="import-position-picker" role="group" aria-label="导入位置">
+          <span class="import-position-label">导入位置</span>
+          <label><input type="radio" name="import-position" value="bottom" checked> 导入到底部</label>
+          <label><input type="radio" name="import-position" value="top"> 导入到顶部</label>
+        </div>
         <div class="import-dropzone" id="import-dropzone">
           <p>拖拽 Excel 文件到此处，或点击上传</p>
-          <p style="font-size:12px;color:#909399">第一行作为表头自动识别列数；模块、标题、操作步骤、备注等标准字段会自动映射，其余列自动创建为自定义字段。导入内容会追加到当前版本底部，用例编号按当前列表顺序自动整理。</p>
+          <p style="font-size:12px;color:#909399">第一行作为表头自动识别列数；模块、标题、操作步骤、备注等标准字段会自动映射，其余列自动创建为自定义字段。导入内容会按上方选择插入顶部或底部，用例编号按当前列表顺序自动整理。</p>
         </div>
         <input type="file" id="import-file" accept=".xlsx,.xls" style="display:none">
         <div class="progress-bar"><div class="progress-fill" id="import-progress"></div></div>
@@ -219,7 +258,6 @@
 
   <div class="toast" id="toast"></div>
   <script>
-    const BACKUP_DIR_DEFAULT = '/backups';
     let lightboxScale = 1;
     let lightboxOffset = {x: 0, y: 0};
     let lightboxDrag = null;
@@ -275,6 +313,6 @@
     });
     document.getElementById('lightbox-img').addEventListener('pointerup', () => {lightboxDrag=null;});
   </script>
-  <script src="/static/js/app.js?v=20260908-02"></script>
+  <script src="/static/js/app.js?v=20260929-08"></script>
 </body>
 </html>
